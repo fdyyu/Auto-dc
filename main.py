@@ -201,13 +201,9 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
     async def on_command(self, ctx):
         """Event when command is triggered"""
         try:
-            # Mengambil args mulai dari indeks 2 jika tersedia
-            args = ctx.args[2:] if len(ctx.args) > 2 else []
-            await self.command_handler.handle_command(
-                ctx, 
-                ctx.command.name,
-                *args,
-                **ctx.kwargs
+        await self.command_handler.handle_command(
+            ctx, 
+            ctx.command.name 
             )
         except Exception as e:
             logger.error(f"Command handling error: {e}")
