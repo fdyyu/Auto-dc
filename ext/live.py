@@ -8,6 +8,7 @@ import asyncio
 import json
 import time
 from typing import Optional, Dict, Any
+from collections import OrderedDict
 
 from ext.product_manager import ProductManagerService
 from ext.balance_manager import BalanceManagerService
@@ -21,6 +22,62 @@ from ext.constants import (
     UPDATE_INTERVAL,
     CACHE_TIMEOUT
 )
+
+# Improved Smart Cache System
+class SmartCache:
+    def __init__(self):
+        self.cache = OrderedDict()
+        self.timeouts = {
+            'balance': 30,    # 30 seconds for balance
+            'stock': 60,      # 1 minute for stock data
+            'world': 300,     # 5 minutes for world info
+            'cooldown': COOLDOWN_SECONDS  # From constants
+        }
+        self._cleanup_task = None
+
+    def get_cached(self, key: str, category: str = 'default') -> Optional[Any]:
+        """Get cached data with category-based timeout"""
+        try:
+            if key in self.cache:
+                data = self.cache[key]
+                current_time = time.time()
+                timeout = self.timeouts.get(category, CACHE_TIMEOUT)
+                
+                if current_time - data['timestamp'] < timeout:
+                    return data['data']
+                else:
+                    del self.cache[key]
+            return None
+        except Exception as e:
+            logger.error(f"Cache get error: {e}")
+            return None
+
+    def set_cached(self, key: str, data: Any, category: str = 'default'):
+        """Set cached data with category"""
+        try:
+            self.cache[key] = {
+                'timestamp': time.time(),
+                'data': data,
+                'category': category
+            }
+        except Exception as e:
+            logger.error(f"Cache set error: {e}")
+
+    def cleanup(self):
+        """Remove expired cache entries"""
+        try:
+            current_time = time.time()
+            expired_keys = []
+            
+            for key, value in self.cache.items():
+                timeout = self.timeouts.get(value.get('category'), CACHE_TIMEOUT)
+                if current_time - value['timestamp'] > timeout:
+                    expired_keys.append(key)
+                    
+            for key in expired_keys:
+                del self.cache[key]
+        except Exception as e:
+            logger.error(f"Cache cleanup error: {e}")
 
 # Setup logging
 logging.basicConfig(
@@ -54,12 +111,13 @@ class LiveStockService(BaseLockHandler):
             self.bot = bot
             self.logger = logging.getLogger("LiveStockService")
             self.product_manager = ProductManagerService(bot)
+            self.smart_cache = SmartCache()
             self.initialized = True
 
     async def create_stock_embed(self, products: list) -> discord.Embed:
-        """Create an elegant stock embed"""
+        """Create an elegant stock embed with improved caching"""
         cache_key = f"stock_embed_{hash(str(products))}"
-        cached = self.get_cached(cache_key)
+        cached = self.smart_cache.get_cached(cache_key, 'stock')
         if cached:
             return cached
 
@@ -71,7 +129,15 @@ class LiveStockService(BaseLockHandler):
         try:
             embed = discord.Embed(
                 title="🏪 Premium Store Status",
-                description="Welcome to our exclusive store!\n━━━━━━━━━━━━━━━━━━━━━━",
+                description=(
+                    "Welcome to our exclusive store!\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "> 💎 **Premium Products**\n"
+                    "> 🔒 **Secure Trading**\n"
+                    "> ⚡ **Instant Delivery**\n"
+                    "> 👥 **24/7 Support**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━"
+                ),
                 color=discord.Color.gold(),
                 timestamp=datetime.utcnow()
             )
@@ -101,19 +167,19 @@ class LiveStockService(BaseLockHandler):
             else:
                 embed.description += "\n\n**No products available at the moment.**\n*Please check back later!*"
 
-            # Add footer with fancy formatting
             current_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
             embed.set_footer(
                 text=f"Last Updated • {current_time} UTC\n━━━━━━━━━━━━━━━━━━━━━━"
             )
             
-            self.set_cached(cache_key, embed, timeout=30)
+            self.smart_cache.set_cached(cache_key, embed, 'stock')
             return embed
 
         finally:
             self.release_lock("create_stock_embed")
+# ... (kode sebelumnya)
 
-class BuyModal(ui.Modal, title="🛍️ Purchase Product"):
+class BuyModal(ui.Modal, title="🛍️ Premium Purchase"):
     def __init__(self, bot):
         super().__init__()
         self.bot = bot
@@ -122,10 +188,11 @@ class BuyModal(ui.Modal, title="🛍️ Purchase Product"):
         self.product_manager = ProductManagerService(bot)
         self.trx_manager = TransactionManager(bot)
         self.modal_lock = asyncio.Lock()
+        self.smart_cache = SmartCache()
 
     code = ui.TextInput(
         label="🏷️ Product Code",
-        placeholder="Enter the product code here...",
+        placeholder="Enter the product code (e.g. DL1, VIP1)",
         min_length=1,
         max_length=10,
         required=True,
@@ -134,7 +201,7 @@ class BuyModal(ui.Modal, title="🛍️ Purchase Product"):
 
     quantity = ui.TextInput(
         label="📦 Quantity",
-        placeholder="How many would you like to buy?",
+        placeholder="How many would you like to buy? (1-99)",
         min_length=1,
         max_length=2,
         required=True,
@@ -152,110 +219,167 @@ class BuyModal(ui.Modal, title="🛍️ Purchase Product"):
         async with self.modal_lock:
             try:
                 await interaction.response.defer(ephemeral=True)
-        
-                growid = await self.balance_manager.get_growid(interaction.user.id)
+                
+                # Check cached GrowID first
+                growid_cache_key = f"growid_{interaction.user.id}"
+                growid = self.smart_cache.get_cached(growid_cache_key, 'user_data')
+                
+                if not growid:
+                    growid = await self.balance_manager.get_growid(interaction.user.id)
+                    if growid:
+                        self.smart_cache.set_cached(growid_cache_key, growid, 'user_data')
+                
                 if not growid:
                     await interaction.followup.send(
-                        "❌ Please set your GrowID first!",
+                        embed=discord.Embed(
+                            title="❌ GrowID Not Set",
+                            description="Please set your GrowID first using the `Set GrowID` button!",
+                            color=discord.Color.red()
+                        ),
                         ephemeral=True
                     )
                     return
-        
-                product = await self.product_manager.get_product(self.code.value)
+
+                # Get product with cache
+                product_cache_key = f"product_{self.code.value}"
+                product = self.smart_cache.get_cached(product_cache_key, 'product')
+                
+                if not product:
+                    product = await self.product_manager.get_product(self.code.value)
+                    if product:
+                        self.smart_cache.set_cached(product_cache_key, product, 'product')
+
                 if not product:
                     await interaction.followup.send(
-                        "❌ Invalid product code! Please check and try again.",
+                        embed=discord.Embed(
+                            title="❌ Invalid Product",
+                            description="The product code you entered is invalid. Please check and try again.",
+                            color=discord.Color.red()
+                        ),
                         ephemeral=True
                     )
                     return
-        
+
                 try:
                     quantity = int(self.quantity.value)
                     if quantity <= 0:
                         raise ValueError()
                 except ValueError:
                     await interaction.followup.send(
-                        "❌ Please enter a valid quantity!",
+                        embed=discord.Embed(
+                            title="❌ Invalid Quantity",
+                            description="Please enter a valid quantity (1-99).",
+                            color=discord.Color.red()
+                        ),
                         ephemeral=True
                     )
                     return
-        
+
+                # Process purchase with improved error handling
                 result = await self.trx_manager.process_purchase(
                     growid=growid,
                     product_code=self.code.value,
                     quantity=quantity
                 )
-        
+
+                # Create beautiful success embed
                 embed = discord.Embed(
                     title="🎉 Purchase Successful!",
-                    description="Thank you for your purchase!",
+                    description=(
+                        "Your order has been processed successfully!\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━"
+                    ),
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
                 
+                # Order details
                 embed.add_field(
                     name="📦 Product",
-                    value=f"```{result['product_name']}```",
+                    value=f"```yaml\n{result['product_name']}```",
                     inline=True
                 )
                 
                 embed.add_field(
                     name="🔢 Quantity",
-                    value=f"```{quantity}```",
+                    value=f"```yaml\n{quantity} units```",
                     inline=True
                 )
                 
                 embed.add_field(
                     name="💎 Total Price",
-                    value=f"```{result['total_price']:,} WL```",
+                    value=f"```yaml\n{result['total_price']:,} WL```",
                     inline=True
                 )
                 
+                # Financial details
                 embed.add_field(
-                    name="💰 Remaining Balance",
-                    value=f"```{result['new_balance']:,} WL```",
+                    name="💰 Balance Update",
+                    value=(
+                        f"```diff\n"
+                        f"- Cost: {result['total_price']:,} WL\n"
+                        f"+ Remaining: {result['new_balance']:,} WL\n"
+                        f"```"
+                    ),
                     inline=False
                 )
-        
-                # Send purchase result via DM
+
+                # Send purchase details via DM
                 dm_sent = await self.trx_manager.send_purchase_result(
                     user=interaction.user,
                     items=result['items'],
                     product_name=result['product_name']
                 )
-        
+
                 if dm_sent:
                     embed.add_field(
                         name="📨 Purchase Details",
-                        value="Check your DMs for detailed purchase information!",
+                        value=(
+                            "> Check your DMs for detailed purchase information!\n"
+                            "> Keep your items safe and secure."
+                        ),
                         inline=False
                     )
                 else:
                     embed.add_field(
-                        name="⚠️ Notice",
-                        value="Could not send DM. Please enable DMs from server members.",
+                        name="⚠️ Important Notice",
+                        value=(
+                            "> Could not send DM. Please enable DMs from server members.\n"
+                            "> Your items will be displayed below."
+                        ),
                         inline=False
                     )
-        
+
                 content_msg = None
                 if not dm_sent:
                     content_msg = "**Your Items:**\n"
                     for item in result['items']:
                         content_msg += f"```yaml\n{item['content']}```\n"
-        
+
+                # Add nice footer
+                embed.set_footer(
+                    text="Thank you for your purchase! | Transaction ID: " + 
+                         f"{result.get('transaction_id', 'N/A')}"
+                )
+
                 await interaction.followup.send(
                     embed=embed,
                     content=content_msg,
                     ephemeral=True
                 )
-        
+
             except Exception as e:
                 error_msg = str(e) if str(e) else "An unexpected error occurred"
                 await interaction.followup.send(
-                    f"❌ {error_msg}",
+                    embed=discord.Embed(
+                        title="❌ Transaction Failed",
+                        description=f"Error: {error_msg}\nPlease try again or contact support.",
+                        color=discord.Color.red()
+                    ),
                     ephemeral=True
                 )
                 self.logger.error(f"Error in BuyModal: {e}")
+# ... (kode sebelumnya)
 
 class SetGrowIDModal(ui.Modal, title="🎮 Set Your GrowID"):
     def __init__(self, bot):
@@ -264,10 +388,11 @@ class SetGrowIDModal(ui.Modal, title="🎮 Set Your GrowID"):
         self.logger = logging.getLogger("SetGrowIDModal")
         self.balance_manager = BalanceManagerService(bot)
         self.modal_lock = asyncio.Lock()
+        self.smart_cache = SmartCache()
 
     growid = ui.TextInput(
         label="🎯 Enter GrowID",
-        placeholder="Type your GrowID here...",
+        placeholder="Your Growtopia account name...",
         min_length=3,
         max_length=20,
         required=True,
@@ -286,30 +411,56 @@ class SetGrowIDModal(ui.Modal, title="🎮 Set Your GrowID"):
             try:
                 await interaction.response.defer(ephemeral=True)
                 
-                if await self.balance_manager.register_user(
+                success = await self.balance_manager.register_user(
                     interaction.user.id,
                     self.growid.value
-                ):
+                )
+                
+                if success:
+                    # Cache the new GrowID
+                    self.smart_cache.set_cached(
+                        f"growid_{interaction.user.id}", 
+                        self.growid.value,
+                        'user_data'
+                    )
+                    
                     embed = discord.Embed(
                         title="✨ GrowID Registration Successful!",
-                        description=f"Your account has been linked successfully.",
+                        description=(
+                            "Your account has been linked successfully.\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            "> 🎮 Account is now activated\n"
+                            "> 💰 You can now check balance\n"
+                            "> 🛍️ Ready to make purchases\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━"
+                        ),
                         color=discord.Color.green(),
                         timestamp=datetime.utcnow()
                     )
                     
                     embed.add_field(
                         name="🎮 GrowID",
-                        value=f"```{self.growid.value}```",
-                        inline=False
+                        value=f"```yaml\n{self.growid.value}```",
+                        inline=True
                     )
                     
                     embed.add_field(
                         name="👤 Discord",
-                        value=f"```{interaction.user}```",
+                        value=f"```yaml\n{interaction.user}```",
+                        inline=True
+                    )
+                    
+                    embed.add_field(
+                        name="📝 Next Steps",
+                        value=(
+                            "> 1. Check your balance with 💰\n"
+                            "> 2. Browse available items\n"
+                            "> 3. Make your first purchase!"
+                        ),
                         inline=False
                     )
                     
-                    embed.set_footer(text="You can now use all store features!")
+                    embed.set_footer(text="Welcome to our premium store! ✨")
                     
                     await interaction.followup.send(
                         embed=embed,
@@ -320,14 +471,22 @@ class SetGrowIDModal(ui.Modal, title="🎮 Set Your GrowID"):
                     )
                 else:
                     await interaction.followup.send(
-                        "❌ Failed to set GrowID. Please try again.",
+                        embed=discord.Embed(
+                            title="❌ Registration Failed",
+                            description="Failed to set GrowID. Please try again or contact support.",
+                            color=discord.Color.red()
+                        ),
                         ephemeral=True
                     )
 
             except Exception as e:
                 self.logger.error(f"Error in SetGrowIDModal: {e}")
                 await interaction.followup.send(
-                    "❌ An unexpected error occurred",
+                    embed=discord.Embed(
+                        title="❌ Error",
+                        description="An unexpected error occurred. Please try again.",
+                        color=discord.Color.red()
+                    ),
                     ephemeral=True
                 )
 
@@ -340,26 +499,36 @@ class StockView(View, BaseLockHandler):
         self.product_manager = ProductManagerService(bot)
         self.trx_manager = TransactionManager(bot)
         self.logger = logging.getLogger("StockView")
+        self.smart_cache = SmartCache()
         self._cache_cleanup.start()
 
     @tasks.loop(minutes=5)
     async def _cache_cleanup(self):
         """Cleanup expired cache entries"""
-        self.cleanup()
+        self.smart_cache.cleanup()
 
     async def _check_cooldown(self, interaction: discord.Interaction) -> bool:
         cooldown_key = f"cooldown_{interaction.user.id}"
-        cooldown_data = self.get_cached(cooldown_key)
+        cooldown_data = self.smart_cache.get_cached(cooldown_key, 'cooldown')
+        
         if cooldown_data:
             remaining = COOLDOWN_SECONDS - (time.time() - cooldown_data['timestamp'])
             if remaining > 0:
                 await interaction.response.send_message(
-                    f"⏳ Please wait {remaining:.1f} seconds...",
+                    embed=discord.Embed(
+                        title="⏳ Cooldown Active",
+                        description=f"Please wait `{remaining:.1f}` seconds...",
+                        color=discord.Color.orange()
+                    ),
                     ephemeral=True
                 )
                 return False
         
-        self.set_cached(cooldown_key, {'timestamp': time.time()}, timeout=COOLDOWN_SECONDS)
+        self.smart_cache.set_cached(
+            cooldown_key, 
+            {'timestamp': time.time()}, 
+            'cooldown'
+        )
         return True
 
     @discord.ui.button(
@@ -375,7 +544,11 @@ class StockView(View, BaseLockHandler):
         lock = await self.acquire_lock(f"balance_{interaction.user.id}")
         if not lock:
             await interaction.response.send_message(
-                "🔒 System is busy, please try again later",
+                embed=discord.Embed(
+                    title="🔒 System Busy",
+                    description="Please try again in a few moments.",
+                    color=discord.Color.orange()
+                ),
                 ephemeral=True
             )
             return
@@ -383,60 +556,98 @@ class StockView(View, BaseLockHandler):
         try:
             await interaction.response.defer(ephemeral=True)
             
-            growid = await self.balance_manager.get_growid(interaction.user.id)
+            # Try to get GrowID from cache first
+            growid = self.smart_cache.get_cached(f"growid_{interaction.user.id}", 'user_data')
+            if not growid:
+                growid = await self.balance_manager.get_growid(interaction.user.id)
+                if growid:
+                    self.smart_cache.set_cached(
+                        f"growid_{interaction.user.id}", 
+                        growid, 
+                        'user_data'
+                    )
+
             if not growid:
                 await interaction.followup.send(
-                    content="❌ Please set your GrowID first!",
+                    embed=discord.Embed(
+                        title="❌ GrowID Not Set",
+                        description="Please set your GrowID first!",
+                        color=discord.Color.red()
+                    ),
                     ephemeral=True
                 )
                 return
 
-            balance = await self.balance_manager.get_balance(growid)
-            if not balance:
+            # Try to get balance from cache
+            balance_key = f"balance_{growid}"
+            balance = self.smart_cache.get_cached(balance_key, 'balance')
+            if balance is None:
+                balance = await self.balance_manager.get_balance(growid)
+                if balance is not None:
+                    self.smart_cache.set_cached(balance_key, balance, 'balance')
+
+            if balance is None:
                 await interaction.followup.send(
-                    content="❌ Balance not found!",
+                    embed=discord.Embed(
+                        title="❌ Balance Not Found",
+                        description="Could not retrieve your balance. Please try again.",
+                        color=discord.Color.red()
+                    ),
                     ephemeral=True
                 )
                 return
 
             embed = discord.Embed(
                 title="💰 Balance Information",
-                description="Your current account balance",
+                description=(
+                    "Your current account balance and details\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━"
+                ),
                 color=discord.Color.gold(),
                 timestamp=datetime.utcnow()
             )
             
             embed.add_field(
                 name="🎮 GrowID",
-                value=f"```{growid}```",
-                inline=False
+                value=f"```yaml\n{growid}```",
+                inline=True
             )
             
             embed.add_field(
                 name="💎 Current Balance",
-                value=f"```{balance:,} WL```",
-                inline=False
+                value=f"```yaml\n{balance:,} WL```",
+                inline=True
             )
             
-            # Add some tips or information
             embed.add_field(
-                name="📝 Note",
-                value="> Use `/donate` to add more balance\n> Use `Buy` button to purchase items",
+                name="📝 Quick Actions",
+                value=(
+                    "> 💸 `/donate` - Add more balance\n"
+                    "> 🛍️ `Buy` - Purchase items\n"
+                    "> 🌍 `World` - Trading world info"
+                ),
                 inline=False
             )
             
-            embed.set_footer(text="Thank you for using our service! ✨")
+            embed.set_footer(
+                text="Thank you for using our service! ✨"
+            )
             
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
             self.logger.error(f"Error in balance callback: {e}")
             await interaction.followup.send(
-                "❌ An error occurred",
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description="An unexpected error occurred. Please try again.",
+                    color=discord.Color.red()
+                ),
                 ephemeral=True
             )
         finally:
             self.release_lock(f"balance_{interaction.user.id}")
+# ... (kode sebelumnya)
 
     @discord.ui.button(
         label="Buy",
@@ -449,10 +660,24 @@ class StockView(View, BaseLockHandler):
             return
 
         try:
-            growid = await self.balance_manager.get_growid(interaction.user.id)
+            # Check GrowID from cache first
+            growid = self.smart_cache.get_cached(f"growid_{interaction.user.id}", 'user_data')
+            if not growid:
+                growid = await self.balance_manager.get_growid(interaction.user.id)
+                if growid:
+                    self.smart_cache.set_cached(f"growid_{interaction.user.id}", growid, 'user_data')
+                    
             if not growid:
                 await interaction.response.send_message(
-                    "❌ Please set your GrowID first!",
+                    embed=discord.Embed(
+                        title="❌ GrowID Required",
+                        description=(
+                            "Please set your GrowID first!\n"
+                            "━━━━━━━━━━━━━━━━━━━━━━\n"
+                            "> Use the `Set GrowID` button to register"
+                        ),
+                        color=discord.Color.red()
+                    ),
                     ephemeral=True
                 )
                 return
@@ -463,7 +688,11 @@ class StockView(View, BaseLockHandler):
         except Exception as e:
             self.logger.error(f"Error in buy callback: {e}")
             await interaction.response.send_message(
-                "❌ An error occurred",
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description="Failed to open purchase menu. Please try again.",
+                    color=discord.Color.red()
+                ),
                 ephemeral=True
             )
 
@@ -484,7 +713,11 @@ class StockView(View, BaseLockHandler):
         except Exception as e:
             self.logger.error(f"Error in set growid callback: {e}")
             await interaction.response.send_message(
-                "❌ An error occurred",
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description="Failed to open GrowID registration. Please try again.",
+                    color=discord.Color.red()
+                ),
                 ephemeral=True
             )
 
@@ -501,7 +734,11 @@ class StockView(View, BaseLockHandler):
         lock = await self.acquire_lock(f"world_{interaction.user.id}")
         if not lock:
             await interaction.response.send_message(
-                "🔒 System is busy, please try again later",
+                embed=discord.Embed(
+                    title="🔒 System Busy",
+                    description="Please try again in a few moments.",
+                    color=discord.Color.orange()
+                ),
                 ephemeral=True
             )
             return
@@ -509,65 +746,100 @@ class StockView(View, BaseLockHandler):
         try:
             await interaction.response.defer(ephemeral=True)
             
-            world_info = await self.product_manager.get_world_info()
+            # Try to get world info from cache
+            world_info = self.smart_cache.get_cached('world_info', 'world')
+            if not world_info:
+                world_info = await self.product_manager.get_world_info()
+                if world_info:
+                    self.smart_cache.set_cached('world_info', world_info, 'world')
+
             if not world_info:
                 await interaction.followup.send(
-                    "❌ World information not available.",
+                    embed=discord.Embed(
+                        title="❌ World Info Unavailable",
+                        description="Trading world information is not available at the moment.",
+                        color=discord.Color.red()
+                    ),
                     ephemeral=True
                 )
                 return
 
             embed = discord.Embed(
-                title="🌍 World Information",
-                description="Current trading world details",
+                title="🌍 Trading World Information",
+                description=(
+                    "Current trading world details and status\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━"
+                ),
                 color=discord.Color.blue(),
                 timestamp=datetime.utcnow()
             )
             
+            # World Info Fields
             embed.add_field(
                 name="🏠 World Name",
-                value=f"```{world_info['world']}```",
+                value=f"```yaml\n{world_info['world']}```",
                 inline=True
             )
             
             if world_info.get('owner'):
                 embed.add_field(
                     name="👑 Owner",
-                    value=f"```{world_info['owner']}```",
+                    value=f"```yaml\n{world_info['owner']}```",
                     inline=True
                 )
                 
             if world_info.get('bot'):
                 embed.add_field(
                     name="🤖 Bot",
-                    value=f"```{world_info['bot']}```",
+                    value=f"```yaml\n{world_info['bot']}```",
                     inline=True
                 )
             
-            # Add some helpful information
+            # Trading Information
             embed.add_field(
-                name="📝 Information",
+                name="📝 Trading Information",
                 value=(
-                    "> 🕒 Trading Hours: 24/7\n"
-                    "> 🔒 Safe Trading Environment\n"
-                    "> 👥 Trusted Middleman Service"
+                    "```ini\n"
+                    "[Trading Hours] : 24/7 Active\n"
+                    "[Security]      : Full Protection\n"
+                    "[Support]       : Live Assistance\n"
+                    "```"
+                ),
+                inline=False
+            )
+            
+            # Additional Information
+            embed.add_field(
+                name="ℹ️ Important Notes",
+                value=(
+                    "> 🕒 Trading is available 24/7\n"
+                    "> 🔒 Safe and secure environment\n"
+                    "> 👥 Trusted middleman service\n"
+                    "> 💬 Support always available"
                 ),
                 inline=False
             )
             
             last_updated = datetime.strptime(world_info['last_updated'], '%Y-%m-%d %H:%M:%S')
-            embed.set_footer(text=f"Last Updated • {last_updated.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            embed.set_footer(
+                text=f"Last Updated • {last_updated.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            )
             
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
             self.logger.error(f"Error in world callback: {e}")
             await interaction.followup.send(
-                "❌ An error occurred",
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description="Failed to retrieve world information. Please try again.",
+                    color=discord.Color.red()
+                ),
                 ephemeral=True
             )
         finally:
             self.release_lock(f"world_{interaction.user.id}")
+# ... (kode sebelumnya)
 
 class LiveStock(commands.Cog, BaseLockHandler):
     def __init__(self, bot):
@@ -580,6 +852,7 @@ class LiveStock(commands.Cog, BaseLockHandler):
             self.stock_view = StockView(bot)
             self.logger = logging.getLogger("LiveStock")
             self._task = None
+            self.smart_cache = SmartCache()
             
             bot.add_view(self.stock_view)
             bot.live_stock_instance = self
@@ -595,11 +868,12 @@ class LiveStock(commands.Cog, BaseLockHandler):
             self._task.cancel()
         if hasattr(self, 'live_stock') and self.live_stock.is_running():
             self.live_stock.cancel()
-        self.cleanup()
+        self.smart_cache.cleanup()
         self.logger.info("LiveStock cog unloaded")
 
     @tasks.loop(seconds=UPDATE_INTERVAL)
     async def live_stock(self):
+        """Update live stock display with smart caching"""
         lock = await self.acquire_lock("live_stock_update")
         if not lock:
             self.logger.warning("Failed to acquire lock for live stock update")
@@ -611,11 +885,30 @@ class LiveStock(commands.Cog, BaseLockHandler):
                 self.logger.error(f"Could not find channel with ID {LIVE_STOCK_CHANNEL_ID}")
                 return
 
-            products = await self.service.product_manager.get_all_products()
+            # Try to get products from cache
+            products = self.smart_cache.get_cached('all_products', 'stock')
+            if not products:
+                products = await self.service.product_manager.get_all_products()
+                if products:
+                    self.smart_cache.set_cached('all_products', products, 'stock')
+
             embed = await self.service.create_stock_embed(products)
             if not embed:
                 self.logger.error("Failed to create stock embed")
                 return
+
+            # Add store status section
+            embed.add_field(
+                name="🏪 Store Status",
+                value=(
+                    "```ini\n"
+                    f"[Status]     : {'🟢 Online' if products else '🔴 Maintenance'}\n"
+                    f"[Last Update]: {datetime.utcnow().strftime('%H:%M:%S UTC')}\n"
+                    f"[Products]   : {len(products) if products else 0} items\n"
+                    "```"
+                ),
+                inline=False
+            )
 
             if self.message_id:
                 try:
@@ -640,39 +933,92 @@ class LiveStock(commands.Cog, BaseLockHandler):
 
     @live_stock.before_loop
     async def before_live_stock(self):
+        """Wait for bot to be ready before starting loop"""
         await self.bot.wait_until_ready()
 
     @commands.command()
     @commands.has_permissions(administrator=True)
     async def setworld(self, ctx, world: str, owner: str = None, bot: str = None):
-        """Set world information"""
+        """Set world information with improved feedback"""
         try:
             if await self.service.product_manager.update_world_info(world, owner, bot):
+                # Invalidate world info cache
+                self.smart_cache.set_cached('world_info', None, 'world')
+                
                 embed = discord.Embed(
                     title="✅ World Information Updated",
-                    description="Trading world details have been updated successfully!",
+                    description=(
+                        "Trading world details have been updated successfully!\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━"
+                    ),
                     color=discord.Color.green(),
                     timestamp=datetime.utcnow()
                 )
                 
-                embed.add_field(name="🏠 World", value=f"```{world}```", inline=True)
+                embed.add_field(
+                    name="🏠 World",
+                    value=f"```yaml\n{world}```",
+                    inline=True
+                )
+                
                 if owner:
-                    embed.add_field(name="👑 Owner", value=f"```{owner}```", inline=True)
+                    embed.add_field(
+                        name="👑 Owner",
+                        value=f"```yaml\n{owner}```",
+                        inline=True
+                    )
+                    
                 if bot:
-                    embed.add_field(name="🤖 Bot", value=f"```{bot}```", inline=True)
+                    embed.add_field(
+                        name="🤖 Bot",
+                        value=f"```yaml\n{bot}```",
+                        inline=True
+                    )
+                
+                embed.add_field(
+                    name="📝 Status",
+                    value=(
+                        "> ✅ World info updated\n"
+                        "> 🔄 Cache refreshed\n"
+                        "> 📢 Changes are now live"
+                    ),
+                    inline=False
+                )
+                
+                embed.set_footer(text=f"Updated by {ctx.author} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
                 
                 await ctx.send(embed=embed)
             else:
-                await ctx.send("❌ Failed to update world information")
+                await ctx.send(
+                    embed=discord.Embed(
+                        title="❌ Update Failed",
+                        description="Failed to update world information. Please try again.",
+                        color=discord.Color.red()
+                    )
+                )
         except Exception as e:
             self.logger.error(f"Error in setworld command: {e}")
-            await ctx.send("❌ An error occurred")
+            await ctx.send(
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description="An unexpected error occurred while updating world information.",
+                    color=discord.Color.red()
+                )
+            )
 
 async def setup(bot):
-    """Setup the LiveStock cog"""
+    """Setup the LiveStock cog with improved logging"""
     try:
         await bot.add_cog(LiveStock(bot))
-        logger.info(f'LiveStock cog loaded successfully at {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC')
+        logger.info(
+            f'LiveStock cog loaded successfully\n'
+            f'Time: {datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC\n'
+            f'Bot Version: {getattr(bot, "version", "unknown")}\n'
+            f'Python Version: {platform.python_version()}'
+        )
     except Exception as e:
-        logger.error(f"Error loading LiveStock cog: {e}")
+        logger.error(
+            f"Error loading LiveStock cog: {e}\n"
+            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
         raise
