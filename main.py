@@ -108,12 +108,23 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
         
         # Load extensions with proper error handling
         extensions = [
-            'cogs.admin',
-            'ext.live',
-            'ext.trx',
-            'ext.donate',
+            # Core Handlers 
+            'ext.cache_manager',      # Cache system first
+            'ext.base_handler',       # Base handlers second
+            'ext.constants',          # Constants third
+            
+            # Service Managers
             'ext.balance_manager',
             'ext.product_manager',
+            'ext.trx',
+            
+            # Main Features
+            'ext.live_stock',
+            'ext.live_buttons',
+            'ext.donate',
+            
+            # Cogs
+            'cogs.admin',            # Admin cog first
             'cogs.stats',
             'cogs.automod',
             'cogs.tickets',
