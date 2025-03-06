@@ -1,205 +1,300 @@
-from typing import Optional, Dict, Any, Set, Union
-from datetime import datetime, timedelta
-import time
-import asyncio
 import logging
-from collections import OrderedDict
-from dataclasses import dataclass
+import time
+import json
+from typing import Optional, Any, Dict
+from datetime import datetime, timedelta
+from sqlite3 import Connection, Error as SQLiteError
+from database import get_connection
+import asyncio
+from functools import wraps
 
-@dataclass
-class CacheItem:
-    value: Any
-    timestamp: float
-    priority: int
-    hits: int = 0
-    last_access: float = time.time()
-    max_memory: int = 0  # Batasan memory dalam bytes
-    category: str = 'default'
+logger = logging.getLogger(__name__)
 
-class EnhancedSmartCacheManager:
+class CacheManager:
+    """
+    Enhanced Cache Manager dengan Database Integration
+    """
     _instance = None
     _lock = asyncio.Lock()
     
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance.initialized = False
         return cls._instance
-
+    
     def __init__(self):
-        if not self.initialized:
-            self.logger = logging.getLogger("EnhancedSmartCacheManager")
-            
-            # Cache storage dengan prioritas
-            self.cache: Dict[str, CacheItem] = OrderedDict()
-            
-            # Konfigurasi timeout yang lebih detail
-            self.timeouts = {
-                'balance': 30,      # Data saldo: update cepat
-                'stock': 60,        # Stok: update menengah
-                'product': 300,     # Produk: jarang update
-                'world': 600,       # Info world: update lambat
-                'user': 1800,       # Data pengguna: sangat stabil
-                'transaction': 45,  # Transaksi: perlu update cepat
-                'default': 120      # Default timeout
-            }
-            
-            # Sistem prioritas yang lebih detail
-            self.priorities = {
-                'balance': 5,    # Prioritas tertinggi - data keuangan
-                'stock': 4,      # Prioritas tinggi - inventori
-                'product': 3,    # Prioritas menengah
-                'world': 2,      # Prioritas rendah
-                'user': 1,       # Prioritas terendah
-                'transaction': 5, # Prioritas tertinggi - transaksi
-                'default': 1
-            }
-            
-            # Batasan cache yang dapat dikonfigurasi
-            self.max_size = 1000
-            self.cleanup_threshold = 0.85  # Cleanup pada 85% kapasitas
-            self.memory_limit = 512 * 1024 * 1024  # 512MB limit
-            
-            # Metrics yang lebih detail
-            self.metrics = {
-                'hits': 0,
-                'misses': 0,
-                'evictions': 0,
-                'cleanups': 0,
-                'memory_usage': 0,
-                'last_cleanup': time.time(),
-                'category_stats': {}
-            }
-            
-            # Background task untuk auto cleanup
-            self.cleanup_task = None
+        if not hasattr(self, 'initialized'):
+            self.memory_cache: Dict[str, Dict] = {}
+            self.logger = logging.getLogger('CacheManager')
             self.initialized = True
-
-    async def start_background_tasks(self):
-        """Memulai background task untuk maintenance cache"""
-        self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
-
-    async def _periodic_cleanup(self):
-        """Task periodic untuk membersihkan cache"""
-        while True:
-            try:
-                await asyncio.sleep(300)  # Cleanup setiap 5 menit
-                await self._smart_cleanup()
-            except Exception as e:
-                self.logger.error(f"Error dalam periodic cleanup: {e}")
-
-    async def get(self, key: str, category: str = 'default') -> Optional[Any]:
-        """Mengambil item dari cache dengan tracking pintar"""
+    
+    async def get(self, key: str, default: Any = None) -> Optional[Any]:
+        """
+        Ambil data dari cache (memory atau database)
+        """
         try:
-            if key in self.cache:
-                item = self.cache[key]
-                current_time = time.time()
-                timeout = self.timeouts.get(category, self.timeouts['default'])
-                
-                if current_time - item.timestamp < timeout:
-                    # Update metrics dan statistik
-                    item.hits += 1
-                    item.last_access = current_time
-                    self.metrics['hits'] += 1
-                    
-                    # Update statistik kategori
-                    if category not in self.metrics['category_stats']:
-                        self.metrics['category_stats'][category] = {'hits': 0, 'misses': 0}
-                    self.metrics['category_stats'][category]['hits'] += 1
-                    
-                    # Adaptive timeout
-                    if item.hits > 100 and item.hits % 100 == 0:
-                        self._adjust_timeout(category, item.hits)
-                    
-                    return item.value
-                    
-                await self._remove(key)
-                self.metrics['evictions'] += 1
-                
-            self.metrics['misses'] += 1
-            if category in self.metrics['category_stats']:
-                self.metrics['category_stats'][category]['misses'] += 1
-            return None
+            # Cek memory cache dulu
+            if key in self.memory_cache:
+                cache_data = self.memory_cache[key]
+                if self._is_valid(cache_data):
+                    self.logger.debug(f"Cache hit (memory): {key}")
+                    return cache_data['value']
+                else:
+                    # Hapus cache yang expired
+                    del self.memory_cache[key]
             
-        except Exception as e:
-            self.logger.error(f"Error saat mengambil cache: {e}")
-            return None
-
-    def _adjust_timeout(self, category: str, hits: int):
-        """Menyesuaikan timeout berdasarkan pola penggunaan"""
-        current_timeout = self.timeouts.get(category, self.timeouts['default'])
-        if hits > 1000:
-            # Untuk item yang sangat sering diakses
-            new_timeout = min(current_timeout * 1.5, 7200)  # Max 2 jam
-        elif hits > 500:
-            new_timeout = min(current_timeout * 1.2, 3600)  # Max 1 jam
-        else:
-            new_timeout = current_timeout
+            # Jika tidak ada di memory, cek database
+            async with self._lock:
+                conn = get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT value, expires_at FROM cache_table WHERE key = ?",
+                        (key,)
+                    )
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        value, expires_at = result
+                        expires_at = datetime.fromisoformat(expires_at)
+                        
+                        if expires_at > datetime.utcnow():
+                            # Cache masih valid
+                            try:
+                                decoded_value = json.loads(value)
+                                # Simpan ke memory cache
+                                self.memory_cache[key] = {
+                                    'value': decoded_value,
+                                    'expires_at': expires_at
+                                }
+                                self.logger.debug(f"Cache hit (database): {key}")
+                                return decoded_value
+                            except json.JSONDecodeError:
+                                self.logger.warning(f"Failed to decode cache value for key: {key}")
+                                return value
+                        else:
+                            # Hapus cache yang expired
+                            cursor.execute("DELETE FROM cache_table WHERE key = ?", (key,))
+                            conn.commit()
+                    
+                    return default
+                    
+                except SQLiteError as e:
+                    self.logger.error(f"Database error in get: {e}")
+                    return default
+                finally:
+                    conn.close()
         
-        self.timeouts[category] = new_timeout
-
-    async def set(self, 
-                 key: str, 
-                 value: Any, 
-                 category: str = 'default',
-                 max_memory: int = None):
-        """Set item cache dengan kontrol memory"""
-        async with self._lock:
-            try:
-                # Cek ukuran value
-                value_size = self._estimate_size(value)
-                if max_memory and value_size > max_memory:
-                    raise ValueError(f"Ukuran value ({value_size} bytes) melebihi batas ({max_memory} bytes)")
-
-                # Cek dan lakukan cleanup jika perlu
-                current_memory = self._calculate_total_memory()
-                if current_memory + value_size > self.memory_limit:
-                    await self._smart_cleanup()
-
-                self.cache[key] = CacheItem(
-                    value=value,
-                    timestamp=time.time(),
-                    priority=self.priorities.get(category, self.priorities['default']),
-                    max_memory=max_memory or 0,
-                    category=category
-                )
-                
-                self.metrics['memory_usage'] = self._calculate_total_memory()
-                
-            except Exception as e:
-                self.logger.error(f"Error saat menyimpan ke cache: {e}")
-
-    def _estimate_size(self, obj: Any) -> int:
-        """Estimasi ukuran objek dalam bytes"""
-        try:
-            import sys
-            return sys.getsizeof(obj)
-        except Exception:
-            return 0
-
-    def _calculate_total_memory(self) -> int:
-        """Menghitung total penggunaan memory cache"""
-        return sum(self._estimate_size(item.value) for item in self.cache.values())
-
-    def get_detailed_metrics(self) -> Dict[str, Any]:
-        """Mendapatkan metrics detail tentang penggunaan cache"""
-        try:
-            total_requests = self.metrics['hits'] + self.metrics['misses']
-            hit_rate = (self.metrics['hits'] / total_requests * 100) if total_requests > 0 else 0
-            
-            current_memory = self._calculate_total_memory()
-            memory_usage_percent = (current_memory / self.memory_limit * 100) if self.memory_limit > 0 else 0
-            
-            return {
-                **self.metrics,
-                'hit_rate': f"{hit_rate:.2f}%",
-                'cache_size': len(self.cache),
-                'max_size': self.max_size,
-                'memory_usage_bytes': current_memory,
-                'memory_usage_percent': f"{memory_usage_percent:.2f}%",
-                'memory_limit_bytes': self.memory_limit,
-                'category_statistics': self.metrics['category_stats']
-            }
         except Exception as e:
-            self.logger.error(f"Error saat mengambil metrics: {e}")
+            self.logger.error(f"Error in get: {e}")
+            return default
+    
+    async def set(self, 
+                  key: str, 
+                  value: Any, 
+                  expires_in: int = 3600,
+                  permanent: bool = False) -> bool:
+        """
+        Simpan data ke cache
+        
+        Args:
+            key: Kunci cache
+            value: Nilai yang akan disimpan
+            expires_in: Waktu kadaluarsa dalam detik (default 1 jam)
+            permanent: Jika True, simpan ke database (default False)
+        """
+        try:
+            expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+            
+            # Simpan ke memory cache
+            self.memory_cache[key] = {
+                'value': value,
+                'expires_at': expires_at
+            }
+            
+            # Jika permanent, simpan juga ke database
+            if permanent:
+                async with self._lock:
+                    conn = get_connection()
+                    try:
+                        cursor = conn.cursor()
+                        
+                        # Konversi value ke JSON jika perlu
+                        if not isinstance(value, (str, int, float, bool)):
+                            value = json.dumps(value)
+                            
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO cache_table (key, value, expires_at)
+                            VALUES (?, ?, ?)
+                        """, (key, value, expires_at.isoformat()))
+                        
+                        conn.commit()
+                        self.logger.debug(f"Cache set (permanent): {key}")
+                        return True
+                        
+                    except SQLiteError as e:
+                        self.logger.error(f"Database error in set: {e}")
+                        return False
+                    finally:
+                        conn.close()
+            
+            self.logger.debug(f"Cache set (memory): {key}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error in set: {e}")
+            return False
+    
+    async def delete(self, key: str) -> bool:
+        """Hapus item dari cache"""
+        try:
+            # Hapus dari memory cache
+            if key in self.memory_cache:
+                del self.memory_cache[key]
+            
+            # Hapus dari database
+            async with self._lock:
+                conn = get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM cache_table WHERE key = ?", (key,))
+                    conn.commit()
+                    return True
+                except SQLiteError as e:
+                    self.logger.error(f"Database error in delete: {e}")
+                    return False
+                finally:
+                    conn.close()
+                    
+        except Exception as e:
+            self.logger.error(f"Error in delete: {e}")
+            return False
+    
+    async def clear(self) -> bool:
+        """Bersihkan semua cache"""
+        try:
+            # Bersihkan memory cache
+            self.memory_cache.clear()
+            
+            # Bersihkan database cache
+            async with self._lock:
+                conn = get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM cache_table")
+                    conn.commit()
+                    return True
+                except SQLiteError as e:
+                    self.logger.error(f"Database error in clear: {e}")
+                    return False
+                finally:
+                    conn.close()
+                    
+        except Exception as e:
+            self.logger.error(f"Error in clear: {e}")
+            return False
+    
+    async def cleanup(self) -> None:
+        """Bersihkan cache yang expired"""
+        try:
+            # Bersihkan memory cache
+            current_time = datetime.utcnow()
+            expired_keys = [
+                key for key, data in self.memory_cache.items()
+                if data['expires_at'] <= current_time
+            ]
+            for key in expired_keys:
+                del self.memory_cache[key]
+            
+            # Bersihkan database cache
+            async with self._lock:
+                conn = get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "DELETE FROM cache_table WHERE expires_at < ?",
+                        (current_time.isoformat(),)
+                    )
+                    conn.commit()
+                except SQLiteError as e:
+                    self.logger.error(f"Database error in cleanup: {e}")
+                finally:
+                    conn.close()
+                    
+        except Exception as e:
+            self.logger.error(f"Error in cleanup: {e}")
+    
+    def _is_valid(self, cache_data: Dict) -> bool:
+        """Cek apakah cache masih valid"""
+        return cache_data['expires_at'] > datetime.utcnow()
+
+    async def get_stats(self) -> Dict:
+        """Dapatkan statistik cache"""
+        try:
+            memory_cache_size = len(self.memory_cache)
+            memory_cache_valid = sum(
+                1 for data in self.memory_cache.values()
+                if self._is_valid(data)
+            )
+            
+            async with self._lock:
+                conn = get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM cache_table")
+                    db_cache_size = cursor.fetchone()[0]
+                    
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM cache_table WHERE expires_at > ?",
+                        (datetime.utcnow().isoformat(),)
+                    )
+                    db_cache_valid = cursor.fetchone()[0]
+                    
+                    return {
+                        'memory_cache': {
+                            'total': memory_cache_size,
+                            'valid': memory_cache_valid,
+                            'expired': memory_cache_size - memory_cache_valid
+                        },
+                        'db_cache': {
+                            'total': db_cache_size,
+                            'valid': db_cache_valid,
+                            'expired': db_cache_size - db_cache_valid
+                        }
+                    }
+                finally:
+                    conn.close()
+                    
+        except Exception as e:
+            self.logger.error(f"Error getting cache stats: {e}")
             return {}
+
+# Decorator untuk caching
+def cached(expires_in: int = 3600, permanent: bool = False):
+    """
+    Decorator untuk caching fungsi
+    
+    Args:
+        expires_in: Waktu kadaluarsa dalam detik (default 1 jam)
+        permanent: Jika True, simpan ke database (default False)
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            cache_key = f"{func.__name__}:{hash(str(args))}-{hash(str(kwargs))}"
+            cache_manager = CacheManager()
+            
+            # Coba ambil dari cache
+            cached_value = await cache_manager.get(cache_key)
+            if cached_value is not None:
+                return cached_value
+            
+            # Jika tidak ada di cache, eksekusi fungsi
+            result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
+            
+            # Simpan ke cache
+            await cache_manager.set(cache_key, result, expires_in, permanent)
+            
+            return result
+        return wrapper
+    return decorator
