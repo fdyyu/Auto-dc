@@ -1,17 +1,17 @@
 import logging
 import asyncio
 import time
-from typing import Dict, List, Optional
+from typing import Optional, Dict
 from datetime import datetime
 
-import discord
+import discord 
 from discord.ext import commands
 
-from .constants import STATUS_AVAILABLE, TransactionError
+from .constants import Balance, TransactionError
 from database import get_connection
-from .base_handler import BaseLockHandler
+from .base_handler import BaseLockHandler, BaseResponseHandler
 
-class ProductManagerService(BaseLockHandler):
+class BalanceManagerService(BaseLockHandler):
     _instance = None
     _instance_lock = asyncio.Lock()
 
@@ -25,323 +25,156 @@ class ProductManagerService(BaseLockHandler):
         if not self.initialized:
             super().__init__()  # Initialize BaseLockHandler
             self.bot = bot
-            self.logger = logging.getLogger("ProductManagerService")
-            self._cache_timeout = 60
+            self.logger = logging.getLogger("BalanceManagerService")
+            self._cache_timeout = 30
             self.initialized = True
 
-    async def create_product(self, code: str, name: str, price: int, description: str = None) -> Dict:
-        """Create a new product with proper locking and cache invalidation"""
-        lock = await self.acquire_lock(f"product_create_{code}")
+    async def get_growid(self, discord_id: str) -> Optional[str]:
+        """Get GrowID for Discord user with proper locking and caching"""
+        cache_key = f"growid_{discord_id}"
+        cached = self.get_cached(cache_key)
+        if cached:
+            return cached
+
+        lock = await self.acquire_lock(cache_key)
+        if not lock:
+            self.logger.warning(f"Failed to acquire lock for get_growid {discord_id}")
+            return None
+
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "SELECT growid FROM user_growid WHERE discord_id = ? COLLATE binary",
+                (str(discord_id),)
+            )
+            result = cursor.fetchone()
+            
+            if result:
+                growid = result['growid']
+                self.set_cached(cache_key, growid, timeout=300)  # Cache for 5 minutes
+                self.logger.info(f"Found GrowID for Discord ID {discord_id}: {growid}")
+                return growid
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error getting GrowID: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+            self.release_lock(cache_key)
+
+    async def register_user(self, discord_id: str, growid: str) -> bool:
+        """Register user with proper locking"""
+        lock = await self.acquire_lock(f"register_{discord_id}")
         if not lock:
             raise TransactionError("System is busy, please try again later")
 
         conn = None
         try:
-            # Check if product already exists
-            existing = await self.get_product(code)
-            if existing:
-                raise TransactionError(f"Product with code '{code}' already exists")
-
             conn = get_connection()
             cursor = conn.cursor()
             
+            # Check for existing GrowID (case-sensitive)
             cursor.execute(
-                """
-                INSERT INTO products (code, name, price, description)
-                VALUES (?, ?, ?, ?)
-                """,
-                (code, name, price, description)
+                "SELECT growid FROM users WHERE growid = ? COLLATE binary",
+                (growid,)
+            )
+            existing = cursor.fetchone()
+            if existing and existing['growid'] != growid:
+                raise ValueError(f"GrowID already exists with different case: {existing['growid']}")
+            
+            # Begin transaction
+            conn.execute("BEGIN TRANSACTION")
+            
+            # Create user if not exists
+            cursor.execute(
+                "INSERT OR IGNORE INTO users (growid) VALUES (?)",
+                (growid,)
+            )
+            
+            # Link Discord ID to GrowID
+            cursor.execute(
+                "INSERT OR REPLACE INTO user_growid (discord_id, growid) VALUES (?, ?)",
+                (str(discord_id), growid)
             )
             
             conn.commit()
-            
-            result = {
-                'code': code,
-                'name': name,
-                'price': price,
-                'description': description
-            }
             
             # Update cache
-            self.set_cached(f"product_{code}", result)
-            self.invalidate_cache("all_products")
+            self.set_cached(f"growid_{discord_id}", growid)
+            self.invalidate_cache(f"balance_{growid}")  # Invalidate any existing balance cache
             
-            self.logger.info(f"Product created: {code}")
-            return result
+            self.logger.info(f"Registered Discord user {discord_id} with GrowID {growid}")
+            return True
 
         except Exception as e:
-            self.logger.error(f"Error creating product: {e}")
+            self.logger.error(f"Error registering user: {e}")
             if conn:
                 conn.rollback()
             raise
         finally:
             if conn:
                 conn.close()
-            self.release_lock(f"product_create_{code}")
+            self.release_lock(f"register_{discord_id}")
 
-    async def get_product(self, code: str) -> Optional[Dict]:
-        """Get product with caching"""
-        cache_key = f"product_{code}"
+    async def get_balance(self, growid: str) -> Optional[Balance]:
+        """Get user balance with proper locking and caching"""
+        cache_key = f"balance_{growid}"
         cached = self.get_cached(cache_key)
         if cached:
             return cached
 
-        lock = await self.acquire_lock(f"product_get_{code}")
+        lock = await self.acquire_lock(cache_key)
         if not lock:
-            self.logger.warning(f"Failed to acquire lock for getting product {code}")
+            self.logger.warning(f"Failed to acquire lock for get_balance {growid}")
             return None
 
         try:
             conn = get_connection()
             cursor = conn.cursor()
-            
-            cursor.execute(
-                "SELECT * FROM products WHERE code = ? COLLATE NOCASE",
-                (code,)
-            )
-            
-            result = cursor.fetchone()
-            if result:
-                product = dict(result)
-                self.set_cached(cache_key, product)
-                return product
-            return None
-
-        except Exception as e:
-            self.logger.error(f"Error getting product: {e}")
-            return None
-        finally:
-            if conn:
-                conn.close()
-            self.release_lock(f"product_get_{code}")
-
-    async def get_all_products(self) -> List[Dict]:
-        """Get all products with caching"""
-        cached = self.get_cached("all_products")
-        if cached:
-            return cached
-
-        lock = await self.acquire_lock("products_getall")
-        if not lock:
-            self.logger.warning("Failed to acquire lock for getting all products")
-            return []
-
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM products ORDER BY code")
-            
-            products = [dict(row) for row in cursor.fetchall()]
-            self.set_cached("all_products", products)
-            return products
-
-        except Exception as e:
-            self.logger.error(f"Error getting all products: {e}")
-            return []
-        finally:
-            if conn:
-                conn.close()
-            self.release_lock("products_getall")
-
-    async def add_stock_item(self, product_code: str, content: str, added_by: str) -> bool:
-        """Add stock item with proper locking"""
-        lock = await self.acquire_lock(f"stock_add_{product_code}")
-        if not lock:
-            raise TransactionError("System is busy, please try again later")
-
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            # Verify product exists
-            cursor.execute(
-                "SELECT code FROM products WHERE code = ? COLLATE NOCASE",
-                (product_code,)
-            )
-            if not cursor.fetchone():
-                raise TransactionError(f"Product {product_code} not found")
             
             cursor.execute(
                 """
-                INSERT INTO stock (product_code, content, added_by, status)
-                VALUES (?, ?, ?, ?)
+                SELECT balance_wl, balance_dl, balance_bgl 
+                FROM users 
+                WHERE growid = ? COLLATE binary
                 """,
-                (product_code, content, added_by, STATUS_AVAILABLE)
+                (growid,)
             )
-            
-            conn.commit()
-            
-            # Invalidate relevant caches
-            self.invalidate_cache(f"stock_count_{product_code}")
-            self.invalidate_cache(f"stock_{product_code}")
-            
-            self.logger.info(f"Stock added for {product_code}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error adding stock item: {e}")
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                conn.close()
-            self.release_lock(f"stock_add_{product_code}")
-
-    async def get_available_stock(self, product_code: str, quantity: int = 1) -> List[Dict]:
-        """Get available stock with proper locking"""
-        lock = await self.acquire_lock(f"stock_get_{product_code}")
-        if not lock:
-            raise TransactionError("System is busy, please try again later")
-
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT id, content, added_at
-                FROM stock
-                WHERE product_code = ? AND status = ?
-                ORDER BY added_at ASC
-                LIMIT ?
-            """, (product_code, STATUS_AVAILABLE, quantity))
-            
-            return [{
-                'id': row['id'],
-                'content': row['content'],
-                'added_at': row['added_at']
-            } for row in cursor.fetchall()]
-
-        except Exception as e:
-            self.logger.error(f"Error getting available stock: {e}")
-            raise
-        finally:
-            if conn:
-                conn.close()
-            self.release_lock(f"stock_get_{product_code}")
-
-    async def get_stock_count(self, product_code: str) -> int:
-        """Get stock count with caching"""
-        cache_key = f"stock_count_{product_code}"
-        cached = self.get_cached(cache_key)
-        if cached is not None:
-            return cached
-
-        lock = await self.acquire_lock(f"stock_count_{product_code}")
-        if not lock:
-            self.logger.warning(f"Failed to acquire lock for stock count {product_code}")
-            return 0
-
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) as count 
-                FROM stock 
-                WHERE product_code = ? AND status = ?
-            """, (product_code, STATUS_AVAILABLE))
-            
-            result = cursor.fetchone()['count']
-            self.set_cached(cache_key, result, timeout=30)  # Cache for 30 seconds
-            return result
-
-        except Exception as e:
-            self.logger.error(f"Error getting stock count: {e}")
-            return 0
-        finally:
-            if conn:
-                conn.close()
-            self.release_lock(f"stock_count_{product_code}")
-
-    async def update_stock_status(self, stock_id: int, status: str, buyer_id: str = None) -> bool:
-        """Update stock status with proper locking"""
-        lock = await self.acquire_lock(f"stock_update_{stock_id}")
-        if not lock:
-            raise TransactionError("System is busy, please try again later")
-
-        conn = None
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            # Get product code first for cache invalidation
-            cursor.execute("SELECT product_code FROM stock WHERE id = ?", (stock_id,))
-            product_result = cursor.fetchone()
-            if not product_result:
-                raise TransactionError(f"Stock item {stock_id} not found")
-            
-            product_code = product_result['product_code']
-            
-            update_query = """
-                UPDATE stock 
-                SET status = ?, updated_at = CURRENT_TIMESTAMP
-            """
-            params = [status]
-
-            if buyer_id:
-                update_query += ", buyer_id = ?"
-                params.append(buyer_id)
-
-            update_query += " WHERE id = ?"
-            params.append(stock_id)
-
-            cursor.execute(update_query, params)
-            conn.commit()
-            
-            # Invalidate relevant caches
-            self.invalidate_cache(f"stock_count_{product_code}")
-            self.invalidate_cache(f"stock_{product_code}")
-            
-            self.logger.info(f"Stock {stock_id} status updated to {status}")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Error updating stock status: {e}")
-            if conn:
-                conn.rollback()
-            return False
-        finally:
-            if conn:
-                conn.close()
-            self.release_lock(f"stock_update_{stock_id}")
-
-    async def get_world_info(self) -> Optional[Dict]:
-        """Get world info with caching"""
-        cached = self.get_cached("world_info")
-        if cached:
-            return cached
-
-        lock = await self.acquire_lock("world_info_get")
-        if not lock:
-            self.logger.warning("Failed to acquire lock for world info")
-            return None
-
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM world_info WHERE id = 1")
             result = cursor.fetchone()
             
             if result:
-                info = dict(result)
-                self.set_cached("world_info", info, timeout=300)  # Cache for 5 minutes
-                return info
+                balance = Balance(
+                    result['balance_wl'],
+                    result['balance_dl'],
+                    result['balance_bgl']
+                )
+                self.set_cached(cache_key, balance, timeout=30)  # Cache for 30 seconds
+                return balance
             return None
 
         except Exception as e:
-            self.logger.error(f"Error getting world info: {e}")
+            self.logger.error(f"Error getting balance: {e}")
             return None
         finally:
             if conn:
                 conn.close()
-            self.release_lock("world_info_get")
+            self.release_lock(cache_key)
 
-    async def update_world_info(self, world: str, owner: str, bot: str) -> bool:
-        """Update world info with proper locking"""
-        lock = await self.acquire_lock("world_info_update")
+    async def update_balance(
+        self, 
+        growid: str, 
+        wl: int = 0, 
+        dl: int = 0, 
+        bgl: int = 0,
+        details: str = "", 
+        transaction_type: str = ""
+    ) -> Optional[Balance]:
+        """Update balance with proper locking and validation"""
+        lock = await self.acquire_lock(f"balance_update_{growid}")
         if not lock:
             raise TransactionError("System is busy, please try again later")
 
@@ -350,48 +183,130 @@ class ProductManagerService(BaseLockHandler):
             conn = get_connection()
             cursor = conn.cursor()
             
-            cursor.execute("""
-                UPDATE world_info 
-                SET world = ?, owner = ?, bot = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = 1
-            """, (world, owner, bot))
+            # Get current balance with retry
+            for attempt in range(3):
+                try:
+                    cursor.execute(
+                        """
+                        SELECT balance_wl, balance_dl, balance_bgl 
+                        FROM users 
+                        WHERE growid = ? COLLATE binary
+                        """,
+                        (growid,)
+                    )
+                    current = cursor.fetchone()
+                    if current:
+                        break
+                    if attempt == 2:  # Last attempt
+                        raise TransactionError(f"User {growid} not found")
+                    await asyncio.sleep(0.1)  # Short delay before retry
+                except Exception as e:
+                    if attempt == 2:  # Last attempt
+                        raise
+                    await asyncio.sleep(0.1)
+            
+            old_balance = Balance(
+                current['balance_wl'],
+                current['balance_dl'],
+                current['balance_bgl']
+            )
+            
+            # Calculate new balance with validation
+            new_wl = max(0, current['balance_wl'] + wl)
+            new_dl = max(0, current['balance_dl'] + dl)
+            new_bgl = max(0, current['balance_bgl'] + bgl)
+            
+            # Additional validation
+            if wl < 0 and abs(wl) > current['balance_wl']:
+                raise TransactionError("Insufficient WL balance")
+            if dl < 0 and abs(dl) > current['balance_dl']:
+                raise TransactionError("Insufficient DL balance")
+            if bgl < 0 and abs(bgl) > current['balance_bgl']:
+                raise TransactionError("Insufficient BGL balance")
+            
+            # Update balance
+            cursor.execute(
+                """
+                UPDATE users 
+                SET balance_wl = ?, balance_dl = ?, balance_bgl = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE growid = ? COLLATE binary
+                """,
+                (new_wl, new_dl, new_bgl, growid)
+            )
+            
+            new_balance = Balance(new_wl, new_dl, new_bgl)
+            
+            # Record transaction with retry
+            for attempt in range(3):
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO transactions 
+                        (growid, type, details, old_balance, new_balance, created_at) 
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            growid,
+                            transaction_type,
+                            details,
+                            old_balance.format(),
+                            new_balance.format()
+                        )
+                    )
+                    break
+                except Exception as e:
+                    if attempt == 2:  # Last attempt
+                        raise
+                    await asyncio.sleep(0.1)
             
             conn.commit()
             
-            # Invalidate cache
-            self.invalidate_cache("world_info")
+            # Update cache
+            self.set_cached(f"balance_{growid}", new_balance, timeout=30)
             
-            self.logger.info("World info updated")
-            return True
+            self.logger.info(
+                f"Updated balance for {growid}: "
+                f"{old_balance.format()} -> {new_balance.format()}"
+            )
+            return new_balance
 
         except Exception as e:
-            self.logger.error(f"Error updating world info: {e}")
+            self.logger.error(f"Error updating balance: {e}")
             if conn:
                 conn.rollback()
-            return False
+            raise
         finally:
             if conn:
                 conn.close()
-            self.release_lock("world_info_update")
+            self.release_lock(f"balance_update_{growid}")
 
-class ProductManagerCog(commands.Cog):
+class BalanceManagerCog(commands.Cog, BaseResponseHandler):
     def __init__(self, bot):
+        super().__init__()
         self.bot = bot
-        self.product_service = ProductManagerService(bot)
-        self.logger = logging.getLogger("ProductManagerCog")
+        self.balance_service = BalanceManagerService(bot)
+        self.logger = logging.getLogger("BalanceManagerCog")
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        self.logger.info(
+            f"BalanceManagerCog is ready at "
+            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
 
     async def cog_load(self):
-        self.logger.info("ProductManagerCog loading...")
+        self.logger.info("BalanceManagerCog loading...")
 
     async def cog_unload(self):
-        await self.product_service.cleanup()
-        self.logger.info("ProductManagerCog unloaded")
+        await self.balance_service.cleanup()
+        self.logger.info("BalanceManagerCog unloaded")
 
 async def setup(bot):
-    if not hasattr(bot, 'product_manager_loaded'):
-        await bot.add_cog(ProductManagerCog(bot))
-        bot.product_manager_loaded = True
+    if not hasattr(bot, 'balance_manager_loaded'):
+        await bot.add_cog(BalanceManagerCog(bot))
+        bot.balance_manager_loaded = True
         logging.info(
-            f'ProductManager cog loaded successfully at '
+            f'BalanceManager cog loaded successfully at '
             f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC'
         )
