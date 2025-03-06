@@ -11,6 +11,7 @@ from database import setup_database, get_connection
 from datetime import datetime
 from utils.command_handler import AdvancedCommandHandler
 from ext.base_handler import BaseLockHandler, BaseResponseHandler
+from ext.cache_manager import CacheManager
 
 # Setup logging dengan file handler
 log_dir = Path('logs')
@@ -88,7 +89,7 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
         intents = discord.Intents.all()
         commands.Bot.__init__(self, command_prefix='!', intents=intents, help_command=commands.DefaultHelpCommand())
         BaseLockHandler.__init__(self)
-        BaseResponseHandler.__init__(self)
+        
         self.session = None
         self.admin_id = ADMIN_ID
         self.guild_id = GUILD_ID
@@ -99,6 +100,7 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
         self.config = config
         self.startup_time = datetime.utcnow()
         self.command_handler = AdvancedCommandHandler(self)
+        self.cache_manager = CacheManager()
 
     async def setup_hook(self):
         """Initialize bot components"""
@@ -112,7 +114,6 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
             'ext.donate',
             'ext.balance_manager',
             'ext.product_manager',
-            # New cogs
             'cogs.stats',
             'cogs.automod',
             'cogs.tickets',
@@ -120,25 +121,35 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
             'cogs.leveling',
         ]
         
-        loaded_extensions = set()  # Track loaded extensions
+        loaded_extensions = set()
         
         for ext in extensions:
             try:
-                if ext not in loaded_extensions:  # Check if not already loaded
+                if ext not in loaded_extensions:
                     await self.load_extension(ext)
                     loaded_extensions.add(ext)
                     logger.info(f'✅ Loaded extension: {ext}')
             except Exception as e:
                 logger.error(f'❌ Failed to load {ext}: {e}')
-                # Log detailed error info
                 logger.exception(f"Detailed error loading {ext}:")
-                continue  # Continue loading other extensions
+                continue
 
     async def close(self):
         """Cleanup when bot shuts down"""
         logger.info("Bot shutting down...")
+        
+        # Cleanup cache
+        try:
+            await self.cache_manager.cleanup()
+            logger.info("Cache cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error cleaning up cache: {e}")
+        
+        # Close aiohttp session
         if self.session:
             await self.session.close()
+            logger.info("Session closed")
+            
         await super().close()
 
     async def on_ready(self):
@@ -159,11 +170,15 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
             'Purchase Log': self.log_purchase_channel_id,
             'Donation Log': self.donation_log_channel_id,
             'History Buy': self.history_buy_channel_id,
-            'Music': int(self.config['channels']['music']),
-            'Logs': int(self.config['channels']['logs'])
+            'Music': int(self.config['channels'].get('music', 0)),
+            'Logs': int(self.config['channels'].get('logs', 0))
         }
 
         for name, channel_id in channels.items():
+            if channel_id == 0:
+                logger.warning(f"{name} channel ID not configured")
+                continue
+                
             channel = guild.get_channel(channel_id)
             if not channel:
                 logger.error(f"Could not find {name} channel with ID {channel_id}")
@@ -178,6 +193,10 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
             ),
             status=discord.Status.online
         )
+        
+        # Initialize cache
+        await self.cache_manager.cleanup()
+        logger.info("Cache initialized")
 
     async def on_message(self, message):
         """Handle message events"""
@@ -198,7 +217,6 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
 
         await self.process_commands(message)
 
-    # Yang benar:
     async def on_command(self, ctx):
         """Event when command is triggered"""
         try:
@@ -213,17 +231,33 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
     async def on_command_error(self, ctx, error):
         """Global error handler"""
         if isinstance(error, commands.errors.CheckFailure):
-            await self.send_response_once(ctx, "❌ You don't have permission to use this command!", delete_after=5)
+            await self.send_response_once(
+                ctx, 
+                "❌ You don't have permission to use this command!", 
+                delete_after=5
+            )
         elif isinstance(error, commands.errors.CommandNotFound):
             pass  # Ignore command not found
         elif isinstance(error, commands.errors.MissingRequiredArgument):
-            await self.send_response_once(ctx, f"❌ Missing required argument: {error.param.name}", delete_after=5)
+            await self.send_response_once(
+                ctx,
+                f"❌ Missing required argument: {error.param.name}",
+                delete_after=5
+            )
         elif isinstance(error, commands.errors.BadArgument):
-            await self.send_response_once(ctx, "❌ Invalid argument provided!", delete_after=5)
+            await self.send_response_once(
+                ctx,
+                "❌ Invalid argument provided!",
+                delete_after=5
+            )
         else:
             error_msg = f'Error in command {ctx.command}: {error}'
             logger.error(error_msg)
-            await self.send_response_once(ctx, "❌ An error occurred! The administrator has been notified.", delete_after=5)
+            await self.send_response_once(
+                ctx,
+                "❌ An error occurred! The administrator has been notified.",
+                delete_after=5
+            )
             
             # Notify admin if serious error
             if not isinstance(error, (commands.errors.CheckFailure, commands.errors.CommandNotFound)):
@@ -265,15 +299,12 @@ async def main():
         logger.error(f'Fatal error: {e}')
         logger.exception("Detailed fatal error:")
         raise
-    finally:
-        if not bot.is_closed():
-            await bot.close()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info('Bot stopped by user')
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.error(f'Fatal error occurred: {e}')
-        logger.exception("Detailed fatal error on startup:")
+        logger.error(f"Unexpected error: {e}")
+        logger.exception("Detailed unexpected error:")
