@@ -198,12 +198,13 @@ class MyBot(commands.Bot, BaseLockHandler, BaseResponseHandler):
 
         await self.process_commands(message)
 
+    # Yang benar:
     async def on_command(self, ctx):
         """Event when command is triggered"""
         try:
-        await self.command_handler.handle_command(
-            ctx, 
-            ctx.command.name 
+            await self.command_handler.handle_command(
+                ctx, 
+                ctx.command.name
             )
         except Exception as e:
             logger.error(f"Command handling error: {e}")
