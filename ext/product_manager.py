@@ -6,7 +6,12 @@ from datetime import datetime
 import discord
 from discord.ext import commands
 
-from .constants import STATUS_AVAILABLE, TransactionError
+from .constants import (
+    Status,          # Untuk status produk
+    TransactionError,# Untuk error handling
+    CACHE_TIMEOUT,  # Untuk cache produk
+    MESSAGES        # Untuk pesan error/success
+)
 from database import get_connection
 from .base_handler import BaseLockHandler
 from .cache_manager import CacheManager
