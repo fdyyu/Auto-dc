@@ -5,8 +5,14 @@ from datetime import datetime
 
 import discord
 from discord.ext import commands, tasks
+from .constants import (
+    Status,          # Untuk status stok
+    COLORS,         # Untuk warna embed
+    UPDATE_INTERVAL,# Untuk interval update (55 seconds)
+    MESSAGES,       # Untuk pesan error/status
+    CACHE_TIMEOUT  # Untuk cache message ID
+)
 
-from .constants import STATUS_AVAILABLE, TransactionError
 from database import get_connection
 from .base_handler import BaseLockHandler
 from .cache_manager import CacheManager
@@ -46,7 +52,7 @@ class LiveStockManager(BaseLockHandler):
                     "Real-time stock information updated every minute\n"
                     "```"
                 ),
-                color=0x2b2d31  # Modern Discord dark theme color
+                color=COLORS['info']  # Menggunakan warna dari constants
             )
 
             # Add server time
@@ -56,7 +62,7 @@ class LiveStockManager(BaseLockHandler):
                 inline=False
             )
 
-            # Group products by category (if you have categories)
+            # Group products by category
             for product in products:
                 stock_count = await self.product_manager.get_stock_count(product['code'])
                 
@@ -77,7 +83,6 @@ class LiveStockManager(BaseLockHandler):
                     inline=True
                 )
 
-            # Add footer with last update time
             embed.set_footer(
                 text="Last Updated",
                 icon_url=self.bot.user.display_avatar.url
@@ -123,7 +128,7 @@ class LiveStockManager(BaseLockHandler):
             await self.cache_manager.set(
                 "live_stock_message_id", 
                 message.id,
-                expires_in=86400,  # 24 hours
+                expires_in=CACHE_TIMEOUT,  # Menggunakan CACHE_TIMEOUT dari constants
                 permanent=True
             )
             
@@ -152,7 +157,10 @@ class LiveStockManager(BaseLockHandler):
         """Cleanup resources"""
         try:
             if self.current_stock_message:
-                await self.current_stock_message.edit(content="Shop is currently offline. Please wait...")
+                await self.current_stock_message.edit(
+                    content="Shop is currently offline. Please wait...",
+                    color=COLORS['warning']  # Menggunakan warna warning dari constants
+                )
         except Exception as e:
             self.logger.error(f"Error in cleanup: {e}")
 
@@ -163,9 +171,9 @@ class LiveStockCog(commands.Cog):
         self.logger = logging.getLogger("LiveStockCog")
         self.update_stock.start()
 
-    @tasks.loop(seconds=55.0)
+    @tasks.loop(seconds=UPDATE_INTERVAL)  # Menggunakan UPDATE_INTERVAL dari constants
     async def update_stock(self):
-        """Update stock display every 55 seconds"""
+        """Update stock display periodically"""
         try:
             await self.stock_manager.update_stock_display()
         except Exception as e:
