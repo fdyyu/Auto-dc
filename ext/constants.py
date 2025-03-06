@@ -1,5 +1,7 @@
 import discord
+from enum import Enum
 from collections import namedtuple
+from typing import Dict, List
 
 # Timeouts and Intervals
 COOLDOWN_SECONDS = 3
@@ -7,25 +9,36 @@ UPDATE_INTERVAL = 55  # seconds
 CACHE_TIMEOUT = 60
 PAGE_TIMEOUT = 60  # seconds
 ADMIN_CONFIRM_TIMEOUT = 30  # seconds
+INTERACTION_TIMEOUT = 15.0  # seconds
 
 # Database Status
-STATUS_AVAILABLE = 'available'
-STATUS_SOLD = 'sold'
-STATUS_DELETED = 'deleted'
-STATUS_PENDING = 'pending'
+class Status:
+    AVAILABLE = 'available'
+    SOLD = 'sold'
+    DELETED = 'deleted'
+    PENDING = 'pending'
 
 # Transaction Types
-TRANSACTION_PURCHASE = 'PURCHASE'
-TRANSACTION_REFUND = 'REFUND'
-TRANSACTION_ADMIN = 'ADMIN'
-TRANSACTION_DEPOSIT = 'DEPOSIT'
-TRANSACTION_WITHDRAW = 'WITHDRAW'
-TRANSACTION_ADMIN_ADD = 'ADMIN_ADD'
-TRANSACTION_ADMIN_REMOVE = 'ADMIN_REMOVE'
-TRANSACTION_ADMIN_RESET = 'ADMIN_RESET'
+class TransactionType:
+    PURCHASE = 'PURCHASE'
+    REFUND = 'REFUND'
+    ADMIN = 'ADMIN'
+    DEPOSIT = 'DEPOSIT'
+    WITHDRAW = 'WITHDRAW'
+    ADMIN_ADD = 'ADMIN_ADD'
+    ADMIN_REMOVE = 'ADMIN_REMOVE'
+    ADMIN_RESET = 'ADMIN_RESET'
+
+    @classmethod
+    def values(cls) -> List[str]:
+        return [
+            cls.PURCHASE, cls.REFUND, cls.ADMIN,
+            cls.DEPOSIT, cls.WITHDRAW,
+            cls.ADMIN_ADD, cls.ADMIN_REMOVE, cls.ADMIN_RESET
+        ]
 
 # Currency Rates
-CURRENCY_RATES = {
+CURRENCY_RATES: Dict[str, int] = {
     'WL': 1,
     'DL': 100,
     'BGL': 10000
@@ -165,3 +178,17 @@ class Balance:
 
     def __repr__(self) -> str:
         return f"Balance(wl={self.wl}, dl={self.dl}, bgl={self.bgl})"
+
+# Exports
+__all__ = [
+    'TransactionType',
+    'Status',
+    'Balance',
+    'TransactionError',
+    'PermissionError',
+    'ValidationError',
+    'CURRENCY_RATES',
+    'COLORS',
+    'MESSAGES',
+    'PERMISSION_LEVELS',
+]
