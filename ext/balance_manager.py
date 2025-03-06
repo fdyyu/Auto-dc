@@ -1,15 +1,15 @@
 import logging
 import asyncio
-import time
-from typing import Optional, Dict
+from typing import Dict, Optional
 from datetime import datetime
 
-import discord 
+import discord
 from discord.ext import commands
 
 from .constants import Balance, TransactionError
 from database import get_connection
-from .base_handler import BaseLockHandler, BaseResponseHandler
+from .base_handler import BaseLockHandler
+from .cache_manager import CacheManager
 
 class BalanceManagerService(BaseLockHandler):
     _instance = None
@@ -26,13 +26,13 @@ class BalanceManagerService(BaseLockHandler):
             super().__init__()  # Initialize BaseLockHandler
             self.bot = bot
             self.logger = logging.getLogger("BalanceManagerService")
-            self._cache_timeout = 30
+            self.cache_manager = CacheManager()
             self.initialized = True
 
     async def get_growid(self, discord_id: str) -> Optional[str]:
         """Get GrowID for Discord user with proper locking and caching"""
         cache_key = f"growid_{discord_id}"
-        cached = self.get_cached(cache_key)
+        cached = await self.cache_manager.get(cache_key)
         if cached:
             return cached
 
@@ -53,7 +53,8 @@ class BalanceManagerService(BaseLockHandler):
             
             if result:
                 growid = result['growid']
-                self.set_cached(cache_key, growid, timeout=300)  # Cache for 5 minutes
+                # Cache GrowID for 1 hour since it rarely changes
+                await self.cache_manager.set(cache_key, growid, expires_in=3600)
                 self.logger.info(f"Found GrowID for Discord ID {discord_id}: {growid}")
                 return growid
             return None
@@ -65,6 +66,37 @@ class BalanceManagerService(BaseLockHandler):
             if conn:
                 conn.close()
             self.release_lock(cache_key)
+
+    async def get_user_by_growid(self, growid: str) -> Optional[str]:
+        """Get Discord ID by GrowID with caching"""
+        cache_key = f"discord_id_{growid}"
+        cached = await self.cache_manager.get(cache_key)
+        if cached:
+            return cached
+
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "SELECT discord_id FROM user_growid WHERE growid = ? COLLATE binary",
+                (growid,)
+            )
+            result = cursor.fetchone()
+            
+            if result:
+                discord_id = result['discord_id']
+                # Cache Discord ID for 1 hour
+                await self.cache_manager.set(cache_key, discord_id, expires_in=3600)
+                return discord_id
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error getting Discord ID: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
 
     async def register_user(self, discord_id: str, growid: str) -> bool:
         """Register user with proper locking"""
@@ -103,9 +135,10 @@ class BalanceManagerService(BaseLockHandler):
             
             conn.commit()
             
-            # Update cache
-            self.set_cached(f"growid_{discord_id}", growid)
-            self.invalidate_cache(f"balance_{growid}")  # Invalidate any existing balance cache
+            # Update caches
+            await self.cache_manager.set(f"growid_{discord_id}", growid, expires_in=3600)
+            await self.cache_manager.set(f"discord_id_{growid}", discord_id, expires_in=3600)
+            await self.cache_manager.delete(f"balance_{growid}")
             
             self.logger.info(f"Registered Discord user {discord_id} with GrowID {growid}")
             return True
@@ -123,8 +156,10 @@ class BalanceManagerService(BaseLockHandler):
     async def get_balance(self, growid: str) -> Optional[Balance]:
         """Get user balance with proper locking and caching"""
         cache_key = f"balance_{growid}"
-        cached = self.get_cached(cache_key)
+        cached = await self.cache_manager.get(cache_key)
         if cached:
+            if isinstance(cached, dict):
+                return Balance(cached['wl'], cached['dl'], cached['bgl'])
             return cached
 
         lock = await self.acquire_lock(cache_key)
@@ -152,7 +187,8 @@ class BalanceManagerService(BaseLockHandler):
                     result['balance_dl'],
                     result['balance_bgl']
                 )
-                self.set_cached(cache_key, balance, timeout=30)  # Cache for 30 seconds
+                # Cache balance for 30 seconds since it changes frequently
+                await self.cache_manager.set(cache_key, balance, expires_in=30)
                 return balance
             return None
 
@@ -262,8 +298,11 @@ class BalanceManagerService(BaseLockHandler):
             
             conn.commit()
             
-            # Update cache
-            self.set_cached(f"balance_{growid}", new_balance, timeout=30)
+            # Update cache with new balance
+            await self.cache_manager.set(f"balance_{growid}", new_balance, expires_in=30)
+            
+            # Also invalidate any transaction history caches
+            await self.cache_manager.delete(f"trx_history_{growid}")
             
             self.logger.info(
                 f"Updated balance for {growid}: "
@@ -281,19 +320,43 @@ class BalanceManagerService(BaseLockHandler):
                 conn.close()
             self.release_lock(f"balance_update_{growid}")
 
-class BalanceManagerCog(commands.Cog, BaseResponseHandler):
+    async def get_transaction_history(self, growid: str, limit: int = 10) -> list:
+        """Get transaction history with caching"""
+        cache_key = f"trx_history_{growid}"
+        cached = await self.cache_manager.get(cache_key)
+        if cached:
+            return cached[:limit]  # Return only requested number of items
+
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT * FROM transactions 
+                WHERE growid = ? COLLATE binary
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (growid, limit))
+            
+            transactions = [dict(row) for row in cursor.fetchall()]
+            
+            # Cache full history for 1 minute
+            await self.cache_manager.set(cache_key, transactions, expires_in=60)
+            
+            return transactions
+
+        except Exception as e:
+            self.logger.error(f"Error getting transaction history: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+class BalanceManagerCog(commands.Cog):
     def __init__(self, bot):
-        super().__init__()
         self.bot = bot
         self.balance_service = BalanceManagerService(bot)
         self.logger = logging.getLogger("BalanceManagerCog")
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        self.logger.info(
-            f"BalanceManagerCog is ready at "
-            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-        )
 
     async def cog_load(self):
         self.logger.info("BalanceManagerCog loading...")
