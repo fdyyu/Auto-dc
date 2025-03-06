@@ -6,8 +6,13 @@ import json
 import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from database import get_connection
-from .constants import Balance, TransactionError, CURRENCY_RATES, MESSAGES
-
+from .constants import (
+    Balance,         # Untuk perhitungan balance
+    TransactionError,# Untuk error handling
+    CURRENCY_RATES, # Untuk konversi mata uang
+    MESSAGES,       # Untuk pesan response
+    TransactionType # Untuk tipe transaksi DONATION
+)
 # Load config
 with open('config.json') as config_file:
     config = json.load(config_file)
