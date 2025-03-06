@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import time
 from typing import Dict, List, Optional
 from datetime import datetime
 
@@ -10,6 +9,7 @@ from discord.ext import commands
 from .constants import STATUS_AVAILABLE, TransactionError
 from database import get_connection
 from .base_handler import BaseLockHandler
+from .cache_manager import CacheManager
 
 class ProductManagerService(BaseLockHandler):
     _instance = None
@@ -26,7 +26,7 @@ class ProductManagerService(BaseLockHandler):
             super().__init__()  # Initialize BaseLockHandler
             self.bot = bot
             self.logger = logging.getLogger("ProductManagerService")
-            self._cache_timeout = 60
+            self.cache_manager = CacheManager()
             self.initialized = True
 
     async def create_product(self, code: str, name: str, price: int, description: str = None) -> Dict:
@@ -62,9 +62,9 @@ class ProductManagerService(BaseLockHandler):
                 'description': description
             }
             
-            # Update cache
-            self.set_cached(f"product_{code}", result)
-            self.invalidate_cache("all_products")
+            # Update cache with new system
+            await self.cache_manager.set(f"product_{code}", result)
+            await self.cache_manager.delete("all_products")  # Invalidate all products cache
             
             self.logger.info(f"Product created: {code}")
             return result
@@ -82,7 +82,7 @@ class ProductManagerService(BaseLockHandler):
     async def get_product(self, code: str) -> Optional[Dict]:
         """Get product with caching"""
         cache_key = f"product_{code}"
-        cached = self.get_cached(cache_key)
+        cached = await self.cache_manager.get(cache_key)
         if cached:
             return cached
 
@@ -103,7 +103,7 @@ class ProductManagerService(BaseLockHandler):
             result = cursor.fetchone()
             if result:
                 product = dict(result)
-                self.set_cached(cache_key, product)
+                await self.cache_manager.set(cache_key, product, expires_in=3600)  # Cache for 1 hour
                 return product
             return None
 
@@ -117,7 +117,7 @@ class ProductManagerService(BaseLockHandler):
 
     async def get_all_products(self) -> List[Dict]:
         """Get all products with caching"""
-        cached = self.get_cached("all_products")
+        cached = await self.cache_manager.get("all_products")
         if cached:
             return cached
 
@@ -133,7 +133,7 @@ class ProductManagerService(BaseLockHandler):
             cursor.execute("SELECT * FROM products ORDER BY code")
             
             products = [dict(row) for row in cursor.fetchall()]
-            self.set_cached("all_products", products)
+            await self.cache_manager.set("all_products", products, expires_in=300)  # Cache for 5 minutes
             return products
 
         except Exception as e:
@@ -174,8 +174,8 @@ class ProductManagerService(BaseLockHandler):
             conn.commit()
             
             # Invalidate relevant caches
-            self.invalidate_cache(f"stock_count_{product_code}")
-            self.invalidate_cache(f"stock_{product_code}")
+            await self.cache_manager.delete(f"stock_count_{product_code}")
+            await self.cache_manager.delete(f"stock_{product_code}")
             
             self.logger.info(f"Stock added for {product_code}")
             return True
@@ -192,6 +192,11 @@ class ProductManagerService(BaseLockHandler):
 
     async def get_available_stock(self, product_code: str, quantity: int = 1) -> List[Dict]:
         """Get available stock with proper locking"""
+        cache_key = f"stock_{product_code}_q{quantity}"
+        cached = await self.cache_manager.get(cache_key)
+        if cached:
+            return cached
+
         lock = await self.acquire_lock(f"stock_get_{product_code}")
         if not lock:
             raise TransactionError("System is busy, please try again later")
@@ -208,11 +213,15 @@ class ProductManagerService(BaseLockHandler):
                 LIMIT ?
             """, (product_code, STATUS_AVAILABLE, quantity))
             
-            return [{
+            result = [{
                 'id': row['id'],
                 'content': row['content'],
                 'added_at': row['added_at']
             } for row in cursor.fetchall()]
+
+            # Cache for a short time since this is frequently changing data
+            await self.cache_manager.set(cache_key, result, expires_in=30)
+            return result
 
         except Exception as e:
             self.logger.error(f"Error getting available stock: {e}")
@@ -225,7 +234,7 @@ class ProductManagerService(BaseLockHandler):
     async def get_stock_count(self, product_code: str) -> int:
         """Get stock count with caching"""
         cache_key = f"stock_count_{product_code}"
-        cached = self.get_cached(cache_key)
+        cached = await self.cache_manager.get(cache_key)
         if cached is not None:
             return cached
 
@@ -244,7 +253,7 @@ class ProductManagerService(BaseLockHandler):
             """, (product_code, STATUS_AVAILABLE))
             
             result = cursor.fetchone()['count']
-            self.set_cached(cache_key, result, timeout=30)  # Cache for 30 seconds
+            await self.cache_manager.set(cache_key, result, expires_in=30)  # Cache for 30 seconds
             return result
 
         except Exception as e:
@@ -291,8 +300,11 @@ class ProductManagerService(BaseLockHandler):
             conn.commit()
             
             # Invalidate relevant caches
-            self.invalidate_cache(f"stock_count_{product_code}")
-            self.invalidate_cache(f"stock_{product_code}")
+            await self.cache_manager.delete(f"stock_count_{product_code}")
+            await self.cache_manager.delete(f"stock_{product_code}")
+            # Also invalidate any quantity specific caches
+            for i in range(1, 101):  # Reasonable range for quantities
+                await self.cache_manager.delete(f"stock_{product_code}_q{i}")
             
             self.logger.info(f"Stock {stock_id} status updated to {status}")
             return True
@@ -309,7 +321,7 @@ class ProductManagerService(BaseLockHandler):
 
     async def get_world_info(self) -> Optional[Dict]:
         """Get world info with caching"""
-        cached = self.get_cached("world_info")
+        cached = await self.cache_manager.get("world_info")
         if cached:
             return cached
 
@@ -327,7 +339,7 @@ class ProductManagerService(BaseLockHandler):
             
             if result:
                 info = dict(result)
-                self.set_cached("world_info", info, timeout=300)  # Cache for 5 minutes
+                await self.cache_manager.set("world_info", info, expires_in=300)  # Cache for 5 minutes
                 return info
             return None
 
@@ -359,7 +371,7 @@ class ProductManagerService(BaseLockHandler):
             conn.commit()
             
             # Invalidate cache
-            self.invalidate_cache("world_info")
+            await self.cache_manager.delete("world_info")
             
             self.logger.info("World info updated")
             return True
