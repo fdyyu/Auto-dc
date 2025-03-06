@@ -6,8 +6,12 @@ from datetime import datetime
 import discord
 from discord.ext import commands
 from discord.ui import Button, View, Modal, TextInput, Select
-
-from .constants import TransactionType, COLORS
+from .constants import (
+    COLORS,        # Untuk warna embed
+    MESSAGES,      # Untuk pesan response
+    Balance,       # Untuk display balance
+    TransactionType # Untuk tipe transaksi
+)
 from .base_handler import BaseLockHandler
 from .cache_manager import CacheManager
 from .product_manager import ProductManagerService
