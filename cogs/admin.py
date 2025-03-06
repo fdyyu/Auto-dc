@@ -12,13 +12,14 @@ import aiohttp
 
 # Import dari file yang sudah diperbarui
 from ext.constants import (
-    COLORS,
-    CURRENCY_RATES,
-    TRANSACTION_TYPES,
-    MAX_STOCK_FILE_SIZE,
-    VALID_STOCK_FORMATS,
-    STATUS_AVAILABLE,
-    STATUS_SOLD
+    Status,              # Untuk status item (AVAILABLE, SOLD)
+    TransactionType,     # Untuk tipe transaksi admin
+    Balance,            # Untuk manajemen balance
+    COLORS,             # Untuk warna embed
+    MESSAGES,           # Untuk pesan response
+    CURRENCY_RATES,     # Untuk konversi mata uang
+    MAX_STOCK_FILE_SIZE,# Untuk validasi file
+    VALID_STOCK_FORMATS # Untuk validasi format file
 )
 from ext.balance_manager import BalanceManagerService
 from ext.product_manager import ProductManagerService
