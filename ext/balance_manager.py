@@ -6,7 +6,12 @@ from datetime import datetime
 import discord
 from discord.ext import commands
 
-from .constants import Balance, TransactionError
+from .constants import (
+    Balance,         # Untuk manajemen balance
+    TransactionError,# Untuk error handling
+    CURRENCY_RATES, # Untuk konversi mata uang
+    CACHE_TIMEOUT  # Untuk cache timeout
+)
 from database import get_connection
 from .base_handler import BaseLockHandler
 from .cache_manager import CacheManager
