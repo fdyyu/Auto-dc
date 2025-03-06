@@ -1,19 +1,27 @@
 import logging
 import asyncio
-import time
-import io
-from typing import Dict, List, Optional
+from typing import Optional, Dict, List, Union
 from datetime import datetime
 
 import discord
 from discord.ext import commands
 
-from .constants import STATUS_AVAILABLE, STATUS_SOLD, TransactionError
+from .constants import (
+    TransactionError, 
+    TransactionType, 
+    Balance, 
+    STATUS_AVAILABLE, 
+    STATUS_SOLD
+)
 from database import get_connection
+from .base_handler import BaseLockHandler
+from .cache_manager import CacheManager
+from .product_manager import ProductManagerService
+from .balance_manager import BalanceManagerService
 
-class TransactionManager:
+class TransactionManager(BaseLockHandler):
     _instance = None
-    _lock = asyncio.Lock()
+    _instance_lock = asyncio.Lock()
 
     def __new__(cls, bot):
         if cls._instance is None:
@@ -23,266 +31,303 @@ class TransactionManager:
 
     def __init__(self, bot):
         if not self.initialized:
+            super().__init__()  # Initialize BaseLockHandler
             self.bot = bot
             self.logger = logging.getLogger("TransactionManager")
-            self._cache = {}
-            self._cache_timeout = 30
-            self._transaction_locks = {}
-            self._response_locks = {}
+            self.cache_manager = CacheManager()
+            self.product_manager = ProductManagerService(bot)
+            self.balance_manager = BalanceManagerService(bot)
             self.initialized = True
 
-    def _get_cached(self, key: str):
-        """Get cached value if valid"""
-        if key in self._cache:
-            data = self._cache[key]
-            if time.time() - data['timestamp'] < self._cache_timeout:
-                return data['value']
-            del self._cache[key]
-        return None
+    async def process_purchase(
+        self, 
+        buyer_id: str, 
+        product_code: str, 
+        quantity: int = 1
+    ) -> Dict[str, Union[str, List[str], int]]:
+        """
+        Process a purchase transaction with proper locking and validation
+        Returns dict with status, message, and content list if successful
+        """
+        lock = await self.acquire_lock(f"purchase_{buyer_id}_{product_code}")
+        if not lock:
+            raise TransactionError("System is busy processing another transaction")
 
-    def _set_cached(self, key: str, value):
-        """Set cache value with timestamp"""
-        self._cache[key] = {
-            'value': value,
-            'timestamp': time.time()
-        }
+        conn = None
+        try:
+            # Get buyer's GrowID and verify registration
+            growid = await self.balance_manager.get_growid(buyer_id)
+            if not growid:
+                raise TransactionError("You need to register your GrowID first!")
 
-    async def _get_transaction_lock(self, key: str) -> asyncio.Lock:
-        """Get or create a transaction lock"""
-        async with self._lock:
-            if key not in self._transaction_locks:
-                self._transaction_locks[key] = asyncio.Lock()
-            return self._transaction_locks[key]
+            # Verify product exists and get details
+            product = await self.product_manager.get_product(product_code)
+            if not product:
+                raise TransactionError(f"Product {product_code} not found")
 
-    async def _get_response_lock(self, key: str) -> asyncio.Lock:
-        """Get or create a response lock"""
-        async with self._lock:
-            if key not in self._response_locks:
-                self._response_locks[key] = asyncio.Lock()
-            return self._response_locks[key]
+            # Check stock availability
+            available_stock = await self.product_manager.get_available_stock(product_code, quantity)
+            if not available_stock or len(available_stock) < quantity:
+                raise TransactionError(
+                    f"Insufficient stock! Only {len(available_stock)} available"
+                )
 
-    async def send_purchase_result(self, user: discord.User, items: list, product_name: str) -> bool:
-        """Send purchase result to user via DM as txt file"""
-        response_lock = await self._get_response_lock(f"dm_{user.id}")
-        async with response_lock:
+            # Calculate total price
+            total_price = product['price'] * quantity
+
+            # Get current balance
+            balance = await self.balance_manager.get_balance(growid)
+            if not balance:
+                raise TransactionError("Could not retrieve balance")
+
+            # Convert price to WL if needed and check balance
+            total_wl = total_price
+            if total_wl > balance.total_wl():
+                raise TransactionError(
+                    f"Insufficient balance! Need {total_wl:,} WL, you have {balance.total_wl():,} WL"
+                )
+
+            conn = get_connection()
+            cursor = conn.cursor()
+            
             try:
-                # Create txt content
-                content = (
-                    f"Purchase Result for {user.name}\n"
-                    f"Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                    f"Product: {product_name}\n"
-                    f"{'-' * 50}\n\n"
-                )
-                
-                for idx, item in enumerate(items, 1):
-                    content += f"Item {idx}:\n{item['content']}\n\n"
-                
-                # Create txt file with timestamp
-                filename = f"result_{user.name}_{int(time.time())}.txt"
-                file = discord.File(
-                    io.StringIO(content),
-                    filename=filename
-                )
-                
-                await user.send("Here is your purchase result:", file=file)
-                self.logger.info(f"Purchase result sent to user {user.name} ({user.id})")
-                return True
-                
-            except discord.Forbidden:
-                self.logger.warning(f"Cannot send DM to user {user.name} ({user.id})")
-                return False
-            except Exception as e:
-                self.logger.error(f"Error sending purchase result: {e}")
-                return False
+                # Begin transaction
+                conn.execute("BEGIN TRANSACTION")
 
-    async def process_purchase(self, growid: str, product_code: str, quantity: int = 1) -> Optional[Dict]:
-        """Process a purchase with proper locking and validation"""
-        lock_key = f"purchase_{growid}_{product_code}"
-        transaction_lock = await self._get_transaction_lock(lock_key)
-        
-        async with transaction_lock:
-            conn = None
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                
-                # Get product details with cache
-                cache_key = f"product_{product_code}"
-                product = self._get_cached(cache_key)
-                
-                if not product:
-                    cursor.execute(
-                        "SELECT price, name FROM products WHERE code = ? COLLATE NOCASE",
-                        (product_code,)
-                    )
-                    product = cursor.fetchone()
-                    if not product:
-                        raise TransactionError(f"Product {product_code} not found")
-                    self._set_cached(cache_key, dict(product))
-                
-                total_price = product['price'] * quantity
-                
-                # Get available stock
-                cursor.execute("""
-                    SELECT id, content 
-                    FROM stock 
-                    WHERE product_code = ? AND status = ?
-                    ORDER BY added_at ASC
-                    LIMIT ?
-                """, (product_code, STATUS_AVAILABLE, quantity))
-                
-                stock_items = cursor.fetchall()
-                if len(stock_items) < quantity:
-                    raise TransactionError(f"Insufficient stock for {product_code}")
-                
-                # Get user balance - case-sensitive
-                cursor.execute(
-                    "SELECT balance_wl FROM users WHERE growid = ? COLLATE binary",
-                    (growid,)
-                )
-                user = cursor.fetchone()
-                if not user:
-                    raise TransactionError(f"User {growid} not found")
-                
-                if user['balance_wl'] < total_price:
-                    raise TransactionError("Insufficient balance")
-                
                 # Update stock status
-                stock_ids = [item['id'] for item in stock_items]
-                placeholders = ','.join('?' * len(stock_ids))
-                cursor.execute(f"""
+                stock_ids = [item['id'] for item in available_stock[:quantity]]
+                content_list = [item['content'] for item in available_stock[:quantity]]
+
+                cursor.executemany(
+                    """
                     UPDATE stock 
                     SET status = ?, buyer_id = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id IN ({placeholders})
-                """, [STATUS_SOLD, growid] + stock_ids)
-                
-                # Update user balance
-                new_balance = user['balance_wl'] - total_price
-                cursor.execute(
-                    "UPDATE users SET balance_wl = ? WHERE growid = ? COLLATE binary",
-                    (new_balance, growid)
+                    WHERE id = ?
+                    """,
+                    [(STATUS_SOLD, buyer_id, stock_id) for stock_id in stock_ids]
                 )
-                
+
+                # Update balance
+                new_balance = await self.balance_manager.update_balance(
+                    growid=growid,
+                    wl=-total_wl,
+                    details=f"Purchase {quantity}x {product['name']}",
+                    transaction_type=TransactionType.PURCHASE.value
+                )
+
                 # Record transaction
                 cursor.execute(
                     """
                     INSERT INTO transactions 
-                    (growid, type, details, old_balance, new_balance, items_count, total_price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (growid, type, details, old_balance, new_balance, created_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
                     (
                         growid,
-                        'PURCHASE',
-                        f"Purchased {quantity} {product_code}",
-                        f"{user['balance_wl']} WL",
-                        f"{new_balance} WL",
-                        quantity,
-                        total_price
+                        TransactionType.PURCHASE.value,
+                        f"Purchased {quantity}x {product['name']} for {total_wl:,} WL",
+                        balance.format(),
+                        new_balance.format()
                     )
                 )
-                
+
                 conn.commit()
-                
+
                 # Invalidate relevant caches
-                self._cache.pop(f"balance_{growid}", None)
-                self._cache.pop(f"stock_{product_code}", None)
-                
+                await self.cache_manager.delete(f"stock_count_{product_code}")
+                await self.cache_manager.delete(f"stock_{product_code}")
+                await self.cache_manager.delete(f"balance_{growid}")
+                await self.cache_manager.delete(f"trx_history_{growid}")
+
+                self.logger.info(
+                    f"Purchase successful: {growid} bought {quantity}x {product_code}"
+                )
+
                 return {
-                    'success': True,
-                    'items': [dict(item) for item in stock_items],
-                    'total_price': total_price,
-                    'new_balance': new_balance,
-                    'product_name': product['name']
+                    'status': 'success',
+                    'message': (
+                        f"Successfully purchased {quantity}x {product['name']}\n"
+                        f"Total paid: {total_wl:,} WL\n"
+                        f"New balance: {new_balance.format()}"
+                    ),
+                    'content': content_list,
+                    'total_paid': total_wl
                 }
 
             except Exception as e:
-                self.logger.error(f"Error processing purchase: {e}")
-                if conn:
-                    conn.rollback()
-                raise
-            finally:
-                if conn:
-                    conn.close()
+                conn.rollback()
+                raise TransactionError(f"Transaction failed: {str(e)}")
 
-    async def get_transaction_history(self, growid: str, limit: int = 10) -> List[Dict]:
-        """Get transaction history with caching"""
-        cache_key = f"trx_history_{growid}_{limit}"
-        cached = self._get_cached(cache_key)
-        if cached:
-            return cached
+        except TransactionError as e:
+            raise
+        except Exception as e:
+            self.logger.error(f"Error processing purchase: {e}")
+            raise TransactionError("An unexpected error occurred")
+        finally:
+            if conn:
+                conn.close()
+            self.release_lock(f"purchase_{buyer_id}_{product_code}")
 
-        async with await self._get_transaction_lock(f"history_{growid}"):
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT * FROM transactions 
-                    WHERE growid = ? COLLATE binary
-                    ORDER BY created_at DESC
-                    LIMIT ?
-                """, (growid, limit))
-                
-                results = [dict(row) for row in cursor.fetchall()]
-                self._set_cached(cache_key, results)
-                return results
+    async def process_deposit(
+        self, 
+        user_id: str, 
+        wl: int = 0, 
+        dl: int = 0, 
+        bgl: int = 0,
+        admin_id: Optional[str] = None
+    ) -> Dict[str, Union[str, Balance]]:
+        """Process a deposit transaction with proper locking"""
+        lock = await self.acquire_lock(f"deposit_{user_id}")
+        if not lock:
+            raise TransactionError("System is busy processing another transaction")
 
-            except Exception as e:
-                self.logger.error(f"Error getting transaction history: {e}")
-                return []
-            finally:
-                if conn:
-                    conn.close()
+        try:
+            # Verify user registration
+            growid = await self.balance_manager.get_growid(user_id)
+            if not growid:
+                raise TransactionError("You need to register your GrowID first!")
 
-    async def get_stock_history(self, product_code: str, limit: int = 10) -> List[Dict]:
-        """Get stock history with caching"""
-        cache_key = f"stock_history_{product_code}_{limit}"
-        cached = self._get_cached(cache_key)
-        if cached:
-            return cached
+            # Calculate total deposit in WL
+            total_wl = wl + (dl * 100) + (bgl * 10000)
+            if total_wl <= 0:
+                raise TransactionError("Deposit amount must be greater than 0")
 
-        async with await self._get_transaction_lock(f"stock_{product_code}"):
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                
-                cursor.execute("""
-                    SELECT * FROM stock 
-                    WHERE product_code = ?
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                """, (product_code, limit))
-                
-                results = [dict(row) for row in cursor.fetchall()]
-                self._set_cached(cache_key, results)
-                return results
+            # Process deposit
+            details = f"Deposit: {wl} WL"
+            if dl > 0:
+                details += f", {dl} DL"
+            if bgl > 0:
+                details += f", {bgl} BGL"
+            if admin_id:
+                admin_name = self.bot.get_user(int(admin_id))
+                details += f" (by {admin_name})"
 
-            except Exception as e:
-                self.logger.error(f"Error getting stock history: {e}")
-                return []
-            finally:
-                if conn:
-                    conn.close()
+            new_balance = await self.balance_manager.update_balance(
+                growid=growid,
+                wl=wl,
+                dl=dl,
+                bgl=bgl,
+                details=details,
+                transaction_type=TransactionType.DEPOSIT.value
+            )
 
-    async def cleanup(self):
-        """Cleanup resources"""
-        self._cache.clear()
-        self._transaction_locks.clear()
-        self._response_locks.clear()
-        
+            self.logger.info(
+                f"Deposit successful: {growid} deposited {total_wl:,} WL"
+            )
+
+            return {
+                'status': 'success',
+                'message': (
+                    f"Successfully deposited:\n"
+                    f"{wl:,} WL{f', {dl:,} DL' if dl > 0 else ''}"
+                    f"{f', {bgl:,} BGL' if bgl > 0 else ''}\n"
+                    f"New balance: {new_balance.format()}"
+                ),
+                'new_balance': new_balance
+            }
+
+        except TransactionError as e:
+            raise
+        except Exception as e:
+            self.logger.error(f"Error processing deposit: {e}")
+            raise TransactionError("An unexpected error occurred")
+        finally:
+            self.release_lock(f"deposit_{user_id}")
+
+    async def process_withdrawal(
+        self, 
+        user_id: str, 
+        wl: int = 0, 
+        dl: int = 0, 
+        bgl: int = 0,
+        admin_id: Optional[str] = None
+    ) -> Dict[str, Union[str, Balance]]:
+        """Process a withdrawal transaction with proper locking"""
+        lock = await self.acquire_lock(f"withdrawal_{user_id}")
+        if not lock:
+            raise TransactionError("System is busy processing another transaction")
+
+        try:
+            # Verify user registration
+            growid = await self.balance_manager.get_growid(user_id)
+            if not growid:
+                raise TransactionError("You need to register your GrowID first!")
+
+            # Get current balance
+            current_balance = await self.balance_manager.get_balance(growid)
+            if not current_balance:
+                raise TransactionError("Could not retrieve balance")
+
+            # Calculate total withdrawal in WL
+            total_wl = wl + (dl * 100) + (bgl * 10000)
+            if total_wl <= 0:
+                raise TransactionError("Withdrawal amount must be greater than 0")
+
+            # Check if sufficient balance
+            if total_wl > current_balance.total_wl():
+                raise TransactionError(
+                    f"Insufficient balance! You have {current_balance.total_wl():,} WL"
+                )
+
+            # Process withdrawal
+            details = f"Withdrawal: {wl} WL"
+            if dl > 0:
+                details += f", {dl} DL"
+            if bgl > 0:
+                details += f", {bgl} BGL"
+            if admin_id:
+                admin_name = self.bot.get_user(int(admin_id))
+                details += f" (by {admin_name})"
+
+            new_balance = await self.balance_manager.update_balance(
+                growid=growid,
+                wl=-wl,
+                dl=-dl,
+                bgl=-bgl,
+                details=details,
+                transaction_type=TransactionType.WITHDRAWAL.value
+            )
+
+            self.logger.info(
+                f"Withdrawal successful: {growid} withdrew {total_wl:,} WL"
+            )
+
+            return {
+                'status': 'success',
+                'message': (
+                    f"Successfully withdrew:\n"
+                    f"{wl:,} WL{f', {dl:,} DL' if dl > 0 else ''}"
+                    f"{f', {bgl:,} BGL' if bgl > 0 else ''}\n"
+                    f"New balance: {new_balance.format()}"
+                ),
+                'new_balance': new_balance
+            }
+
+        except TransactionError as e:
+            raise
+        except Exception as e:
+            self.logger.error(f"Error processing withdrawal: {e}")
+            raise TransactionError("An unexpected error occurred")
+        finally:
+            self.release_lock(f"withdrawal_{user_id}")
+
 class TransactionCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.trx_manager = TransactionManager(bot)
         self.logger = logging.getLogger("TransactionCog")
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        self.logger.info(f"TransactionCog is ready at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    async def cog_load(self):
+        self.logger.info("TransactionCog loading...")
+
+    async def cog_unload(self):
+        self.logger.info("TransactionCog unloaded")
 
 async def setup(bot):
-    """Setup the Transaction cog"""
-    if not hasattr(bot, 'transaction_cog_loaded'):
+    if not hasattr(bot, 'transaction_manager_loaded'):
         await bot.add_cog(TransactionCog(bot))
-        bot.transaction_cog_loaded = True
-        logging.info(f'Transaction cog loaded successfully at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC')
+        bot.transaction_manager_loaded = True
+        logging.info(
+            f'Transaction Manager cog loaded successfully at '
+            f'{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC'
+        )
